@@ -1,0 +1,19 @@
+# pnpm 构建脚本表态 —— 这是**有意的决定**，不是自动生成的。
+#
+# 背景：pnpm 11+ 默认拒绝任何「没提前表态」的依赖构建脚本，并且**以非零退出码失败**
+# （ERR_PNPM_IGNORED_BUILDS）。而 `dsh plugin add` 只在安装成功时才把插件登记进
+# `dsh.profile.bundles` —— 结果是「包装了但从不加载，且没有提示」。
+#
+# 我们的决定：**两个都拒绝构建（false）**。
+#
+#   ssh2         —— 纯 JavaScript 实现；构建脚本只做可选原生加速的准备，
+#                   不构建完全不影响功能（已实测：能加载、能连）。
+#   cpu-features —— 可选的 native 加速模块，需要 C++ 工具链。允许它构建会让
+#                   「没有编译环境的用户」装不上插件，换来的只是一点特性探测。
+#
+# 所以本插件**零原生依赖**：任何平台的用户都能直接装上。
+# 安装器（scripts/install.mjs）会把同样的表态写进用户 profile 的
+# pnpm-workspace.yaml —— 因为真正需要这个表态的是 `dsh plugin add` 那一步。
+allowBuilds:
+  ssh2: false
+  cpu-features: false

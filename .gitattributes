@@ -1,0 +1,28 @@
+# 行尾统一成 LF。
+#
+# 为什么必须显式声明：本插件没有构建步骤，宿主直接加载 `src/*.js`；目标环境一律是
+# POSIX shell（见 CONTRIBUTING）。而 Windows 上 git 的默认 `core.autocrlf=true`
+# 会在检出时把文本文件换成 CRLF —— 对别的贡献者（Linux/macOS）来说，同一个文件
+# 就有两种行尾，diff 里全是噪音，脚本也可能因 CRLF 而跑不起来。
+#
+# 这里只做归一化，不做转换：仓库里存的、检出的都是 LF。
+* text=auto eol=lf
+
+# 明确按文本处理（避免被当成二进制而失去行尾归一化）
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.cjs  text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+*.sh   text eol=lf
+
+# 二进制文件不碰
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.woff binary
+*.woff2 binary

@@ -1,0 +1,16 @@
+# dsh-multi-remote bundle patch
+#
+# 这个文件是 package.json 里 `dsh.bundle.patch` 指向的 bundle 层。
+# 通过官方 CLI 安装时——
+#
+#   dsh plugin --profile <name> add @jk-uzi/dsh-multi-remote
+#
+# ——CLI 会核对 `dsh.profile.bundles` 与已安装包，看到本声明后把
+# `@jk-uzi/dsh-multi-remote` 追加到 profile 的 bundle 栈；profile 启动时再合并
+# 这个 patch（一条 insert）完成挂载，**不需要手工改 profile 文件**。
+#
+# 注意：`name` 必须是包名（loader 靠它解析模块），`id` 是这一行在
+# 配置树里的标识，可与包名不同但要在 profile 内唯一。
+- insert:
+    - id: multi-remote
+      name: '@jk-uzi/dsh-multi-remote'

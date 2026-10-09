@@ -1,0 +1,133 @@
+{
+  "name": "@jk-uzi/dsh-multi-remote",
+  "version": "0.1.0",
+  "description": "DSH 插件：SSH / WSL / Docker 三合一远程开发——agent 的文件读写、命令执行、搜索与终端全部落在目标环境，大脑留在本地",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": {
+      "default": "./src/index.js"
+    },
+    "./client": {
+      "default": "./src/client.js"
+    },
+    "./world/fs.js": {
+      "default": "./src/world/fs.js"
+    },
+    "./world/shell.js": {
+      "default": "./src/world/shell.js"
+    },
+    "./world/search.js": {
+      "default": "./src/world/search.js"
+    },
+    "./world/terminal.js": {
+      "default": "./src/world/terminal.js"
+    },
+    "./terminal/session.js": {
+      "default": "./src/terminal/session.js"
+    },
+    "./terminal/backend.js": {
+      "default": "./src/terminal/backend.js"
+    },
+    "./terminal/backends.js": {
+      "default": "./src/terminal/backends.js"
+    },
+    "./terminal/tool.js": {
+      "default": "./src/terminal/tool.js"
+    },
+    "./terminal/quote.js": {
+      "default": "./src/terminal/quote.js"
+    },
+    "./mirror/index.js": {
+      "default": "./src/mirror/index.js"
+    },
+    "./session/preset.js": {
+      "default": "./src/session/preset.js"
+    },
+    "./session/profile.js": {
+      "default": "./src/session/profile.js"
+    },
+    "./session/connection.js": {
+      "default": "./src/session/connection.js"
+    },
+    "./session/binder.js": {
+      "default": "./src/session/binder.js"
+    },
+    "./transport/registry.js": {
+      "default": "./src/transport/registry.js"
+    },
+    "./transport/wsl.js": {
+      "default": "./src/transport/wsl.js"
+    },
+    "./transport/docker.js": {
+      "default": "./src/transport/docker.js"
+    },
+    "./transport/tar.js": {
+      "default": "./src/transport/tar.js"
+    },
+    "./transport/transport.js": {
+      "default": "./src/transport/transport.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md",
+    "CONTRIBUTING.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test",
+    "install:plugin": "node scripts/install.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "remote-development",
+    "remote-ssh",
+    "ssh",
+    "wsl",
+    "docker"
+  ],
+  "license": "MIT",
+  "author": "jk-uzi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jk-uzi/dsh-multi-remote.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jk-uzi/dsh-multi-remote/issues"
+  },
+  "homepage": "https://github.com/jk-uzi/dsh-multi-remote#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.2 <0.3.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-modules",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ],
+      "platform": "web"
+    }
+  },
+  "dependencies": {
+    "ssh2": "^1.17.0"
+  }
+}

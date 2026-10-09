@@ -1,0 +1,40 @@
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+out/
+*.tsbuildinfo
+coverage/
+
+# 锁文件不入库：这是**库**不是应用。
+# 我们的依赖面只有一个 ssh2，让消费者自己解析即可；
+# 提交锁文件会把维护者本地的解析结果（含 registry 与 peer 快照）变成仓库噪音。
+# 注意 pnpm-workspace.yaml **要**入库 —— 它承载「拒绝原生构建」的表态，是源码的一部分。
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+
+# 日志与临时文件
+*.log
+npm-debug.log*
+pnpm-debug.log*
+.tmp/
+tmp/
+
+# 环境与凭据（绝不入库）
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+.remote-ssh.json
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 本地开发残留
+.dsh/
+*.local

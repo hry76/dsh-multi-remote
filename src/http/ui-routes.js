@@ -42,13 +42,21 @@ export const ROUTE_UI_MACHINE_OPEN = '/multi-remote/machine-open'
 export const ROUTE_UI_MACHINE_DISCONNECT = '/multi-remote/machine-disconnect'
 
 /**
+ * 打开任务：`machine-open` 现在**任务化**了 —— POST 启动任务立即返回 `taskId`，
+ * 前端轮询本端点拿「走到哪一步」的实时进度，点取消则调用 `open-cancel`。
+ * 这样大项目打开时界面不再是一个黑盒的「正在连接…」转圈。
+ */
+export const ROUTE_UI_OPEN_PROGRESS = '/multi-remote/open-progress'
+export const ROUTE_UI_OPEN_CANCEL = '/multi-remote/open-cancel'
+
+/**
  * 把锚点目录**建成工作区并起个像样的名字**。
  *
  * 为什么放在宿主侧做：客户端那边要先 `ctx.get('workspaces')` 拿到服务再创建，
  * 实测**拿不到**（自动创建失败，退化成了「请手工打开这个目录」的提示 ——
  * 用户看到的正是那句提示）。宿主侧本来就能访问 `workspaceRegistry`，
  * 而且 `create(path, title)` **支持标题** —— 正好满足
- * 「工作区应该显示 `ssh:/home/user/my-proj/my-proj` 而不是 mr-ssh-home-user-…」。
+ * 「工作区应该显示 `ssh:/data/my-proj/my-proj` 而不是 mr-ssh-home-user-…」。
  */
 export const ROUTE_UI_OPEN_WORKSPACE = '/multi-remote/open-workspace'
 
@@ -57,7 +65,7 @@ export const ROUTE_UI_OPEN_WORKSPACE = '/multi-remote/open-workspace'
  *
  * 演进过程（用户的三次反馈，每次都更准）：
  *   1. `mr-ssh-home-user-my-proj-afea9e990734`   内部标识，看不懂
- *   2. `ssh:/home/user/my-proj/my-proj`             能看懂，但**太长**，侧边栏放不下
+ *   2. `ssh:/data/my-proj/my-proj`             能看懂，但**太长**，侧边栏放不下
  *   3. `my-proj`                               短了，但**看不出是哪台机器**
  *   4. `ssh:my-proj`                           ← 现在：短 + 带后端标识
  *
@@ -131,11 +139,6 @@ export function normalizeSettingsPatch(raw) {
     throw new Error('设置必须是一个对象')
   }
   const patch = {}
-
-  if (raw.workspaceFlow !== undefined) {
-    if (typeof raw.workspaceFlow !== 'boolean') throw new Error('workspaceFlow 必须是布尔值')
-    patch.workspaceFlow = raw.workspaceFlow
-  }
 
   if (raw.auditCapacity !== undefined) {
     patch.auditCapacity = intInRange(raw.auditCapacity, 'auditCapacity', SETTINGS_LIMITS.auditCapacity)

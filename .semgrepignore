@@ -1,0 +1,7 @@
+# Semgrep 的忽略清单 —— 与 .hardcodeignore 保持同步。
+#
+# 为什么豁免 test/**：测试夹具必须是具体值（Windows 盘符、内网 IP 反例、假私钥），
+# 它们不是环境绑定。完整理由见 .hardcodeignore。
+#
+# ⚠️ 两个文件要一起改：check_hardcode.py 读 .hardcodeignore，Semgrep 读这个。
+test/

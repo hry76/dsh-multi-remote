@@ -229,6 +229,8 @@ test('入口：注册全部路由，路径不与宿主 /api 冲突', async () =>
     '/multi-remote/machine-disconnect',
     '/multi-remote/machine-list',
     '/multi-remote/machine-open',
+    '/multi-remote/open-cancel',
+    '/multi-remote/open-progress',
     '/multi-remote/open-workspace',
     '/multi-remote/pick-directory',
     '/multi-remote/ping',
@@ -243,7 +245,7 @@ test('入口：注册全部路由，路径不与宿主 /api 冲突', async () =>
 })
 
 test('设置路由：GET 报**生效值**；没有 configEditor 时如实说改不了', async () => {
-  const ctx = await mountPlugin({ config: { workspaceFlow: false, auditCapacity: 42 } })
+  const ctx = await mountPlugin({ config: { auditCapacity: 42 } })
   const route = ctx.routes.get('/multi-remote/settings')
 
   const get = fakeHttp({ method: 'GET' })
@@ -252,12 +254,11 @@ test('设置路由：GET 报**生效值**；没有 configEditor 时如实说改�
   const body = JSON.parse(get.captured.body)
   assert.equal(body.ok, true)
   assert.equal(body.editable, false, '假 ctx 里没有 configEditor 服务')
-  assert.equal(body.config.workspaceFlow, false, '要报**生效值**，不是默认值')
-  assert.equal(body.config.auditCapacity, 42)
+  assert.equal(body.config.auditCapacity, 42, '要报**生效值**，不是默认值')
   assert.equal(typeof body.config.mirrorDeepen.enabled, 'boolean')
   assert.ok(body.limits.auditCapacity.min > 0, '要把取值范围告诉界面')
 
-  const post = fakeHttp({ method: 'POST', body: { workspaceFlow: true } })
+  const post = fakeHttp({ method: 'POST', body: { auditCapacity: 100 } })
   await route.handler(post.req, post.res)
   const saved = JSON.parse(post.captured.body)
   assert.equal(saved.ok, false, '没有服务时**不许假装保存成功**')
@@ -274,7 +275,7 @@ test('设置路由：把补丁**合并**进配置（不抹掉没提到的字段�
   const editor = {
     entries: () => [ours, { id: 'include:other', options: { name: '@x/y' } }],
     async edit(target, change) {
-      calls.push({ target, next: change({ workspaceFlow: true, mirrorDeepen: { enabled: true, maxFileBytes: 1 } }, {}) })
+      calls.push({ target, next: change({ auditCapacity: 300, mirrorDeepen: { enabled: true, maxFileBytes: 1 } }, {}) })
     },
   }
   const ctx = await mountPlugin({ services: { configEditor: editor } })
@@ -286,14 +287,13 @@ test('设置路由：把补丁**合并**进配置（不抹掉没提到的字段�
 
   const post = fakeHttp({
     method: 'POST',
-    body: { workspaceFlow: false, auditCapacity: 100, mirrorDeepen: { maxTotalBytesMiB: 8 } },
+    body: { auditCapacity: 100, mirrorDeepen: { maxTotalBytesMiB: 8 } },
   })
   await route.handler(post.req, post.res)
   const saved = JSON.parse(post.captured.body)
   assert.equal(saved.ok, true, saved.error)
   assert.equal(calls.length, 1)
   assert.equal(calls[0].target, ours, '要改的是**我们自己那一行**')
-  assert.equal(calls[0].next.workspaceFlow, false)
   assert.equal(calls[0].next.auditCapacity, 100)
   assert.equal(calls[0].next.mirrorDeepen.enabled, true, '没提到的字段不能被抹掉')
   assert.equal(calls[0].next.mirrorDeepen.maxFileBytes, 1, '没提到的字段不能被抹掉')
@@ -308,7 +308,7 @@ test('设置路由：非法值明确报 400，不静默改成默认值', async (
     { auditCapacity: 'many' },
     { auditCapacity: 1 },
     { mirrorDeepen: { maxFileBytesMiB: 99999 } },
-    { workspaceFlow: 'yes' },
+    { mirrorDeepen: { enabled: 'yes' } },
   ]) {
     const post = fakeHttp({ method: 'POST', body: bad })
     await route.handler(post.req, post.res)
@@ -348,7 +348,6 @@ test('界面路由：connect-options 不含任何凭据', async () => {
   assert.equal(captured.status, 200)
   const body = JSON.parse(captured.body)
   assert.equal(body.ok, true)
-  assert.equal(body.workspaceFlow, true, '默认开启')
   assert.deepEqual(body.kinds, ['wsl', 'ssh', 'docker'])
   // 认证相关字段里**只有私钥路径**允许出现 —— 它是**路径**不是凭据（凭据是
   // 私钥**内容**与口令），而界面正是靠它把「用过的连接」填满。
@@ -362,13 +361,14 @@ test('界面路由：connect-options 不含任何凭据', async () => {
   assert.ok(/"privateKeyPath"\s*:/.test(flat), '私钥路径应当出现（否则「用过的连接」填不满）')
 })
 
-test('界面路由：workspaceFlow=false 时如实告诉界面（界面据此不接管 `+` 按钮）', async () => {
-  const ctx = await mountPlugin({ config: { workspaceFlow: false } })
+test('界面路由：没有「显示/隐藏入口」的自造开关 —— 插件的开与关由 DSH 自己管', async () => {
+  const ctx = await mountPlugin()
   const route = ctx.routes.get('/multi-remote/connect-options')
   const { req, res, captured } = fakeHttp({ method: 'GET' })
   await route.handler(req, res)
-  assert.equal(JSON.parse(captured.body).workspaceFlow, false)
-  // 负对照：忽略这个开关 → 用户关不掉 `+` 按钮的接管，只能卸载整个插件
+  assert.ok(!('workspaceFlow' in JSON.parse(captured.body)), 'connect-options 不该再暴露入口开关')
+  // 负对照：留着一个和宿主插件开关重复、而且改了要刷新页面才生效的开关
+  //          → 用户看到两个「开关」，还不知道哪个算数
 })
 
 // ── 栅栏（安全红线）─────────────────────────────────────────────────────────
@@ -820,4 +820,65 @@ test('remote_profiles：机器级档案（没有项目根）不许打印出 unde
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test('machine-open 任务化：返回 taskId，进度轮询到 done，结果含锚点', async () => {
+  const ctx = await mountPlugin({ config: { createTransport: () => fakeTransport() } })
+
+  // 1. 先连机器
+  const mc = ctx.routes.get('/multi-remote/machine-connect')
+  const r1 = fakeHttp({ method: 'POST', body: { kind: 'docker', container: 'c1' } })
+  await mc.handler(r1.req, r1.res)
+  const machineId = JSON.parse(r1.captured.body).machine.id
+  assert.ok(machineId)
+
+  // 2. machine-open → 立即返回 taskId（不阻塞）
+  const mo = ctx.routes.get('/multi-remote/machine-open')
+  const r2 = fakeHttp({ method: 'POST', body: { machineId, remoteRoot: '/remote/proj' } })
+  const t0 = Date.now()
+  await mo.handler(r2.req, r2.res)
+  assert.ok(Date.now() - t0 < 1000, '启动任务不该阻塞到连接完成')
+  const { ok, taskId } = JSON.parse(r2.captured.body)
+  assert.equal(ok, true)
+  assert.ok(typeof taskId === 'string' && taskId !== '')
+
+  // 3. 轮询进度到 done
+  const op = ctx.routes.get('/multi-remote/open-progress')
+  let status = 'running'
+  for (let i = 0; i < 100 && status === 'running'; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    const r3 = fakeHttp({ method: 'GET', url: '/multi-remote/open-progress?task=' + taskId })
+    await op.handler(r3.req, r3.res)
+    status = JSON.parse(r3.captured.body).status
+  }
+  assert.equal(status, 'done', '任务应当跑到 done')
+
+  // 4. done 后能拿到最终结果（含锚点 + 标题）
+  const r4 = fakeHttp({ method: 'GET', url: '/multi-remote/open-progress?task=' + taskId })
+  await op.handler(r4.req, r4.res)
+  const final = JSON.parse(r4.captured.body)
+  assert.equal(final.status, 'done')
+  assert.ok(final.result.anchorPath, '结果要带锚点目录')
+  assert.ok(final.result.title, '结果要带工作区标题')
+  // 负对照：一次性同步返回 → 大项目打开期间界面卡成黑盒
+})
+
+test('open-progress：任务不存在时如实报错，不假装在跑', async () => {
+  const ctx = await mountPlugin({ config: { createTransport: () => fakeTransport() } })
+  const op = ctx.routes.get('/multi-remote/open-progress')
+  const r = fakeHttp({ method: 'GET', url: '/multi-remote/open-progress?task=not-exist' })
+  await op.handler(r.req, r.res)
+  const body = JSON.parse(r.captured.body)
+  assert.equal(body.ok, false)
+  assert.match(body.error, /不存在|过期/)
+  // 负对照：返回 status='running' → 前端无限轮询一个死任务
+})
+
+test('open-cancel：对已结束的任务如实报「不存在或已结束」', async () => {
+  const ctx = await mountPlugin({ config: { createTransport: () => fakeTransport() } })
+  const oc = ctx.routes.get('/multi-remote/open-cancel')
+  const r = fakeHttp({ method: 'POST', body: { taskId: 'not-exist' } })
+  await oc.handler(r.req, r.res)
+  assert.equal(JSON.parse(r.captured.body).ok, false)
+  // 负对照：cancel 一个不存在的任务返回 ok:true → 前端以为取消成功，其实什么都没发生
 })

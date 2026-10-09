@@ -17,6 +17,7 @@ import { readFile } from 'node:fs/promises'
 
 import { SshTransport, KnownHosts, HOST_KEY_RESULT, wrapCommand, shellQuote, fingerprintFromKnownHostsKey, toFingerprint } from '../src/transport/ssh.js'
 import { TRANSPORT_ERROR, TransportError, assertNoNul } from '../src/transport/transport.js'
+import { buildTar, TAR_TYPE } from '../src/transport/tar.js'
 
 // ── 1. 纯逻辑 ────────────────────────────────────────────────────────────────
 
@@ -379,7 +380,7 @@ test('端到端：密码错误要分类成 AUTH_FAILED，而不是笼统失败',
 
 test('端到端：SSH 交互式终端（真 PTY、状态持久、信号、resize）', { skip: e2e ? false : '未设置 DSH_MR_SSH_TEST=1' }, async () => {
   // 走**与插件完全相同**的那一层：RemoteTerminalBackend → transport.spawnTerminal。
-  // 这条补的是 R-0005 遗留 1（SSH 终端原先没有真机验证）。
+  // 这条补的是「SSH 终端原先没有真机验证」这个缺口。
   const { RemoteTerminalBackend } = await import('../src/terminal/backend.js')
   const transport = new SshTransport({
     host: e2eConfig.host,
@@ -461,4 +462,128 @@ test('端到端：SSH 交互式终端（真 PTY、状态持久、信号、resize
     }
     await transport.disconnect()
   }
+})
+
+// ── walkTree + readFilesBatch（2026-10-09 新增：SSH 快路，find 拿结构 + tar 拉内容）──
+//
+// 不测真 SSH（那是 e2e 的事）：在 transport 实例上打桩 `exec`。
+// 断言 walkTree（find -printf 解析）+ readFilesBatch（tar 流解析）+ 探测降级。
+
+/** 造一个打了桩的 SshTransport：exec 按命令内容返回指定输出。 */
+function stubExecTransport({ findOk = true, findOutput = '', tarOk = true, tarBuffer = Buffer.alloc(0), tarStderr = '', execCalls }) {  const transport = new SshTransport({ host: 'example.invalid', username: 'x' })
+  transport.exec = async (command, options) => {
+    execCalls.push(command)
+    if (command.includes('GNU_OK')) {
+      return { code: findOk ? 0 : 1, stdout: findOk ? 'GNU_OK\n' : '', stderr: '' }
+    }
+    if (command.includes('TAR_OK')) {
+      return { code: tarOk ? 0 : 1, stdout: tarOk ? 'TAR_OK\n' : '', stderr: '' }
+    }
+    if (command.includes('-printf')) {
+      return { code: 0, stdout: Buffer.from(findOutput, 'utf8'), stderr: '' }
+    }
+    if (command.startsWith('tar cf -')) {
+      return { code: 0, stdout: tarBuffer, stderr: tarStderr }
+    }
+    return { code: 0, stdout: '', stderr: '' }
+  }
+  return transport
+}
+
+/** 把多个 tar 条目拼成一条流（每个条目一个 tar 块，连起来）。 */
+function tarStream(items) {
+  // buildTar 每个条目自带「2 个零块」的结束标记 —— 直接拼接会被 parseTar
+  // 当成提前终止。所以切掉每条的尾部 1024 字节（2×512 零块）再拼，
+  // 最后统一补一个总结束块。
+  const BLOCK = 512
+  const parts = items.map((item) => buildTar(item).subarray(0, buildTar(item).length - BLOCK * 2))
+  return Buffer.concat([...parts, Buffer.alloc(BLOCK * 2)])
+}
+
+test('walkTree：一次 find -printf 拿整棵树的元数据（结构，不含内容）', async () => {
+  const execCalls = []
+  // find 输出协议：relPath\0type\0size\0mtime\0 四元组
+  const findOutput = [
+    'src', 'd', '0', '1700000000.0',
+    'README.md', 'f', '5', '1700000000.0',
+    'src/a.js', 'f', '19', '1700000001.0',
+    'big.bin', 'f', '614400', '1700000002.0',
+    'link', 'l', '0', '1700000003.0',
+  ].join('\0') + '\0'
+  const transport = stubExecTransport({ findOutput, execCalls })
+
+  const result = await transport.walkTree('/srv/proj')
+
+  assert.equal(execCalls.length, 2)
+  assert.match(execCalls[0], /GNU_OK/)
+  assert.match(execCalls[1], /-printf/)
+
+  const dirs = result.entries.filter((e) => e.type === 'directory').map((e) => e.relPath)
+  const files = result.entries.filter((e) => e.type === 'file').map((e) => e.relPath)
+  const others = result.entries.filter((e) => e.type === 'other').map((e) => e.relPath)
+  assert.deepEqual(dirs.sort(), ['src'])
+  assert.deepEqual(files.sort(), ['README.md', 'big.bin', 'src/a.js'])
+  assert.deepEqual(others, ['link'])
+
+  const readme = result.entries.find((e) => e.relPath === 'README.md')
+  assert.equal(readme.size, 5)
+  assert.equal(readme.mtimeMs, 1_700_000_000_000)
+  assert.equal(readme.data, undefined, 'walkTree 不碰内容（内容交给 readFilesBatch）')
+
+  // 负对照：走 tar 拿结构 → 大文件内容一起打包，12659 文件直接超时（真机实测 120s）
+})
+
+test('walkTree：远端没有 GNU find → 探测失败并如实报不可用', async () => {
+  const transport = stubExecTransport({ findOk: false, execCalls: [] })
+  await assert.rejects(
+    () => transport.walkTree('/srv/proj'),
+    (error) => {
+      assert.equal(error.code, TRANSPORT_ERROR.UNKNOWN)
+      assert.match(error.message, /GNU find|SFTP 标准路/)
+      return true
+    },
+  )
+  // 负对照：探测失败仍硬走 find -printf → busybox 的 find 报错被误当成空树
+})
+
+test('readFilesBatch：一次 tar 拉一批小文件，缺失文件给 NOT_FOUND', async () => {
+  const execCalls = []
+  const tarBuffer = tarStream([
+    { name: '/a.txt', type: TAR_TYPE.FILE, content: 'AAA\n', mtimeMs: 1 },
+    { name: '/sub/b.txt', type: TAR_TYPE.FILE, content: 'BBB\n', mtimeMs: 1 },
+  ])
+  const transport = stubExecTransport({ tarBuffer, execCalls })
+
+  const out = await transport.readFilesBatch(['/a.txt', '/missing.txt', '/sub/b.txt'], { maxBytes: 1024 })
+
+  assert.equal(execCalls.length, 2) // 探测 tar + 一次 tar
+  assert.deepEqual(out.get('/a.txt').data.toString('utf8'), 'AAA\n')
+  assert.deepEqual(out.get('/sub/b.txt').data.toString('utf8'), 'BBB\n')
+  assert.equal(out.get('/missing.txt').ok, false)
+  assert.equal(out.get('/missing.txt').error.code, TRANSPORT_ERROR.NOT_FOUND)
+  // 负对照：退回逐个 SFTP readFile → 每个文件 open+read+close 好几次往返
+})
+
+test('readFilesBatch：超限文件给 TOO_LARGE（失败，不截断）', async () => {
+  const transport = stubExecTransport({
+    tarBuffer: tarStream([{ name: '/big.bin', type: TAR_TYPE.FILE, content: Buffer.alloc(1000, 1), mtimeMs: 1 }]),
+    execCalls: [],
+  })
+  const out = await transport.readFilesBatch(['/big.bin'], { maxBytes: 10 })
+  const r = out.get('/big.bin')
+  assert.equal(r.ok, false)
+  assert.equal(r.error.code, TRANSPORT_ERROR.TOO_LARGE)
+  // 负对照：静默截断 → 上层以为拿到完整内容
+})
+
+test('readFilesBatch：远端没有 tar → 抛错（镜像层据此降级逐个读）', async () => {
+  const transport = stubExecTransport({ tarOk: false, execCalls: [] })
+  await assert.rejects(
+    () => transport.readFilesBatch(['/a.txt']),
+    (error) => {
+      assert.equal(error.code, TRANSPORT_ERROR.UNKNOWN)
+      assert.match(error.message, /tar|SFTP 逐个读/)
+      return true
+    },
+  )
 })

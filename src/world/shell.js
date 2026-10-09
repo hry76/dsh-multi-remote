@@ -31,9 +31,8 @@
  * 远程命令**不受本地 DSH 沙箱约束** —— 边界是目标账号自身的权限。
  * 所以这里 `sandboxMode` 恒为 `undefined`，绝不上报一个本地沙箱模式。
  */
-import { requireTransport } from '../transport/registry.js'
+import { routeByRemotePath, translateToRemote } from '../session/workspace-routes.js'
 import { TRANSPORT_ERROR } from '../transport/transport.js'
-import { toRemoteWorkdir as toRemoteWorkdirShared } from './translate.js'
 
 /** 默认单次命令超时（毫秒），与宿主 bash-local 的默认一致。 */
 const DEFAULT_TIMEOUT_MS = 120_000
@@ -246,35 +245,33 @@ export class RemoteShellProcess {
 }
 
 export function apply(ctx, config = {}) {
-  const profileId = config.profileId
-  const remoteRoot = config.remoteRoot
-  if (typeof profileId !== 'string' || profileId === '') {
-    throw new Error('world-shell: config.profileId 必填（拿不到就拒绝挂载，绝不回退到本机）')
-  }
-  if (typeof remoteRoot !== 'string' || !remoteRoot.startsWith('/')) {
-    throw new Error('world-shell: config.remoteRoot 必须是以 / 开头的绝对 POSIX 路径')
-  }
-  /** 本机锚点目录：会话 cwd 就是它，工具会把它当 workdir 传下来。 */
-  const localAnchorPath = typeof config.localAnchorPath === 'string' ? config.localAnchorPath : undefined
-
+  // 方案 A：shell 不再绑固定连接 —— 每次执行按 workdir 路由到对应工作区。
   const log = ctx.logger
-  const transport = () => requireTransport(profileId)
 
   /**
-   * 把 workdir 归一成**远程**路径。
+   * 把 workdir 翻译成**远程绝对路径**并路由到所属工作区。
    *
    * 实测踩过的坑：`tool-bash` 会用**会话工作目录**作为默认 workdir，
-   * 而会话 cwd 是本机锚点目录（`D:\...\anchors\mr-x`）—— 那个路径在远程不存在，
-   * 报错就是远程 bash 的 `cd: D:\...\anchor: 没有那个文件或目录`。
+   * 而会话 cwd 是本机锚点目录（`<盘符>:\...\anchors\mr-x`）—— 那个路径在远程不存在，
+   * 报错就是远程 bash 的 `cd: <盘符>:\...\anchor: 没有那个文件或目录`。
+   * 翻译 + 路由统一走 `translateToRemote`。
    *
-   * 翻译逻辑已抽到 `world/translate.js`（`world/fs` 也要用同一条规则，
-   * 两处共用一份实现，避免漂移）。
+   * @returns {{ remotePath: string, ctx: object }}
    */
-  const toRemoteWorkdir = (workdir) => toRemoteWorkdirShared(workdir, {
-    remoteRoot,
-    ...localAnchorPath === undefined ? {} : { localAnchorPath },
-    log,
-  })
+  const toRemoteWorkdir = (workdir) => {
+    const raw = String(workdir ?? '').trim()
+    if (raw === '') {
+      throw new Error('shell: 无法确定命令在哪个远程项目执行（workdir 为空且没有可路由的上下文）')
+    }
+    try {
+      return translateToRemote(raw)
+    } catch (error) {
+      if (error?.code === TRANSPORT_ERROR.NOT_CONNECTED || error?.code === TRANSPORT_ERROR.NOT_FOUND) {
+        throw error
+      }
+      throw new Error(`shell: ${error?.message ?? '无法确定远程工作目录'}`)
+    }
+  }
 
   /** 活跃进程集合：组合拆除时全部终止，不留孤儿。 */
   const live = new Set()
@@ -297,7 +294,7 @@ export function apply(ctx, config = {}) {
       return {
         command: String(request.command ?? ''),
         // 关键：把本机锚点路径翻译成远程路径（工具默认传的是会话 cwd = 锚点）
-        workdir: toRemoteWorkdir(request.workdir),
+        workdir: request.workdir === undefined || String(request.workdir).trim() === '' ? undefined : toRemoteWorkdir(request.workdir).remotePath,
         timeoutMs,
         onExpiry,
         stdoutMaxBytes: request.stdoutMaxBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
@@ -312,13 +309,14 @@ export function apply(ctx, config = {}) {
       if (command.trim() === '') {
         throw new Error('shell: command 不能为空')
       }
+      const routed = toRemoteWorkdir(spec.workdir)
       const process = new RemoteShellProcess({
         command,
-        workdir: toRemoteWorkdir(spec.workdir),
+        workdir: routed.remotePath,
         timeoutMs: spec.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         armed: (spec.onExpiry ?? 'kill') === 'kill',
         stdoutMaxBytes: spec.stdoutMaxBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
-        transport: transport(),
+        transport: routed.ctx.transport,
         signal: spec.signal,
       })
       live.add(process)
@@ -337,5 +335,5 @@ export function apply(ctx, config = {}) {
     return Promise.allSettled(running.map((process) => process.stop()))
   }, 'world-shell: 终止活跃远程命令')
 
-  log?.info?.('[world-shell] 隔离域 shell 已挂载（档案 %s，根 %s）', profileId, remoteRoot)
+  log?.info?.('[world-shell] 隔离域 shell 已挂载（按 workdir 路由，不绑固定连接）')
 }

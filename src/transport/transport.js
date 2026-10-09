@@ -3,7 +3,7 @@
  *
  * 上层（镜像层、隔离域内的 fs/shell provider、工具、UI）**只认这个接口**，
  * 不认具体后端。这是「一个插件三个功能」的成本关键：SSH 打磨对了，
- * WSL / Docker 基本只是填 Transport（见 docs 的路线图）。
+ * WSL / Docker 基本只是填 Transport。
  *
  * 本文件**只有契约与错误分类**，没有实现 —— 也刻意不引入任何 npm 依赖。
  *
@@ -103,6 +103,16 @@ export class Transport {
     }
     /** @type {'ssh'|'wsl'|'docker'} */
     this.kind = kind
+    /**
+     * 「拉一批文件」时建议的并发路数。上层（镜像层）按它分批，
+     * **后端自己仍须硬限流**（见 WSL 的 `#acquire`：8 路以上会打死 relay）——
+     * 这个值只是「别一次发出比这更多的请求」的礼貌约定。
+     * - SSH：长连接 + SFTP 天然支持流水线，8 路是 sshd 默认 MaxSessions 的一半（留余量）
+     * - WSL：4（`MAX_CONCURRENT`，实测硬上限）
+     * - Docker：HTTP 命名管道，无所谓，给个温和值
+     * @type {number}
+     */
+    this.readConcurrency = 8
   }
 
   /** @returns {Promise<void>} 建立连接。失败抛 {@link TransportError}。 */
@@ -137,8 +147,12 @@ export class Transport {
   /**
    * 读文件。
    * @param {string} path
-   * @param {{ encoding?: BufferEncoding, maxBytes?: number, signal?: AbortSignal }} [options]
+   * @param {{ encoding?: BufferEncoding, maxBytes?: number, signal?: AbortSignal,
+   *           knownSize?: number }} [options]
    *   `maxBytes` 是**硬上限**：超过必须以 `TRANSPORT_TOO_LARGE` 失败，绝不截断。
+   *   `knownSize`：调用方**已经知道**的文件大小（比如目录遍历时拿到的）。
+   *   给了它，实现可以跳过「先 stat 查大小」那次往返 —— SSH 上每个文件省一次 RTT。
+   *   实现仍须校验实际读到的长度（远端可能刚好在这之间变了，见各实现的说明）。
    * @returns {Promise<string|Buffer>}
    */
   async readFile(path, options) {

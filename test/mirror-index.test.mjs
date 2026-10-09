@@ -146,6 +146,23 @@ test('Mirror.init：拉下目录树、建 git 仓库、提交基线、写状态'
   })
 })
 
+test('Mirror.init：signal 已中止时抛 ABORTED，绝不吞成「部分成功」', async () => {
+  await withTempDir(async (dir) => {
+    const anchor = join(dir, 'anchor')
+    const transport = fakeTransport({ '/remote/proj': { 'README.md': '# hi\n' } })
+    const mirror = new Mirror({ transport, anchorPath: anchor, remoteRoot: '/remote/proj', profileId: 'conn-1' })
+    const controller = new AbortController()
+    controller.abort()
+
+    await assert.rejects(
+      () => mirror.init({ signal: controller.signal }),
+      (error) => error.code === TRANSPORT_ERROR.ABORTED,
+      '取消必须抛出去，让连接层清理锚点 —— 吞成 report.errors 会让取消形同虚设',
+    )
+    // 负对照：吞掉 ABORTED → connect 照常继续走到预设注册，用户点取消却没反应
+  })
+})
+
 test('Mirror.init：二次调用不重复提交基线（后续更新要保持未提交）', async () => {
   await withTempDir(async (dir) => {
     const anchor = join(dir, 'anchor')
@@ -370,7 +387,7 @@ test('Mirror.init：项目 .gitignore 通过 ignore 选项生效', async () => {
 })
 
 test('镜像：在界面上手改镜像**不会**影响远程', async () => {
-  // 这条对应「镜像只给界面看、远程是唯一真相」这个定位（D-017）。
+  // 这条对应「镜像只给界面看、远程是唯一真相」这个定位。
   // 用户完全可能在界面的编辑器里改镜像里的文件 —— 必须保证那只是本地副本。
   await withTempDir(async (dir) => {
     const anchor = join(dir, 'anchor')

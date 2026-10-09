@@ -12,7 +12,7 @@
  *
  * 所以**零 npm 依赖**就能做到，不必引入 `dockerode`（项目硬约束：只允许 `ssh2`）。
  *
- * ## 文件内容走 archive 端点，元数据走 exec（D-021）
+ * ## 文件内容走 archive 端点，元数据走 exec
  *
  * | 操作 | 走哪条 | 为什么 |
  * |---|---|---|
@@ -20,7 +20,7 @@
  * | **元数据**（stat / readdir） | exec | tar 头信息有限，拿不到完整的权限与符号链接语义 |
  * | **原子写** | exec（`mktemp` + `mv -f`） | archive 没有「原子替换」原语 |
  *
- * ## 范围（已定 D-004）
+ * ## 范围
  *
  * **只连已运行的容器**，绝不创建 / 启动。找不到或没在跑就明确报错。
  *
@@ -939,7 +939,7 @@ export class DockerTransport extends Transport {
    * 而 `exec` 不行。所以这里不再一刀切拒绝 —— 而是记下状态，
    * 把限制留给真正需要 exec 的操作去报（错误信息里会说清是「没在运行」而不是「没 shell」）。
    *
-   * 范围约束（D-004）不变：**绝不创建 / 启动容器**。
+   * 范围约束不变：**绝不创建 / 启动容器**。
    */
   async connect() {
     if (this.connected) return
@@ -1399,6 +1399,7 @@ export class DockerTransport extends Transport {
       signal: options.signal,
     })
     if (moved.code !== 0) {
+      // 尽力清理临时文件：失败不能覆盖下面那个**真正的**错误
       await this.#execRaw(['rm', '-f', '--', tempPath], {
         timeoutMs: FILE_TIMEOUT_MS,
       }).catch(() => {})

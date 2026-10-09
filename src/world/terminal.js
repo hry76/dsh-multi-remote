@@ -18,7 +18,7 @@
  * `DUPLICATE_BACKEND`。官方那个本地 shell 后端占用了 `shell`，所以我们必须用别的名字。
  * 这也正好：模型在远程会话里开终端，本来就该走远程后端。
  */
-import { requireTransport } from '../transport/registry.js'
+import { routeByRemotePath } from '../session/workspace-routes.js'
 import { RemoteTerminalBackend, REMOTE_TERMINAL_TYPE, registerRemoteTerminalBackend } from '../terminal/backend.js'
 import { buildTerminalTool } from '../terminal/tool.js'
 
@@ -28,25 +28,17 @@ export const name = '@jk-uzi/dsh-multi-remote/world-terminal'
  * 域内需要的服务。
  *
  * `terminals` 是宿主**单例**服务（后端表在服务级，不随隔离域分家），
- * 但我们注册的后端实例持有**域内的 transport** —— 所以域内开出来的终端是远程的。
+ * 但我们注册的后端实例**按 cwd 路由 transport** —— 所以域内开出来的终端
+ * 永远连到 cwd 所属的那台远程机器。
  */
 export const inject = ['terminals', 'tools']
 
-/** 终端初始目录：远程项目根（而不是本机锚点目录）。 */
+/**
+ * 方案 A：后端**不再绑固定连接**，开终端时按 cwd 路由。
+ */
 export function apply(ctx, config = {}) {
-  const profileId = config.profileId
-  const remoteRoot = config.remoteRoot
-  const label = config.label ?? profileId
+  const label = config.label ?? '远程'
   const log = ctx.logger
-
-  if (typeof profileId !== 'string' || profileId === '') {
-    throw new Error('world-terminal: config.profileId 必填（拿不到就拒绝挂载，绝不回退到本机）')
-  }
-  if (typeof remoteRoot !== 'string' || !remoteRoot.startsWith('/')) {
-    throw new Error(`world-terminal: config.remoteRoot 必须是绝对 POSIX 路径，得到：${remoteRoot}`)
-  }
-
-  const transport = () => requireTransport(profileId)
 
   // 把挂载过程写进一个进程内可读的痕迹，便于探针/自检确认它到底跑到哪一步。
   // （域内的 logger 未必可见，所以自己记一份。）
@@ -54,7 +46,7 @@ export function apply(ctx, config = {}) {
     try {
       const g = globalThis
       g.__DSH_MR_TERMINAL_TRACE ??= []
-      g.__DSH_MR_TERMINAL_TRACE.push({ profileId, step, detail: detail ?? null, at: Date.now() })
+      g.__DSH_MR_TERMINAL_TRACE.push({ step, detail: detail ?? null, at: Date.now() })
     } catch {
       // 记录失败不该影响挂载
     }
@@ -63,10 +55,9 @@ export function apply(ctx, config = {}) {
 
   // ── 1. 注册后端 ──────────────────────────────────────────────────────────
   const backend = new RemoteTerminalBackend({
-    transport: transport(),
+    // 方案 A：spawn 时按 cwd（远程初始目录）路由到对应的 transport
+    route: (cwd) => routeByRemotePath(cwd)?.transport,
     label,
-    // 终端开在**远程项目根**：会话 cwd 是本机锚点目录，对终端没有意义
-    cwd: remoteRoot,
     log: (...args) => log?.info?.(...args),
   })
   const unregister = registerRemoteTerminalBackend(ctx, backend)
@@ -79,7 +70,7 @@ export function apply(ctx, config = {}) {
 
   const tool = buildTerminalTool({
     terminals,
-    labelOf: () => `${label}（${transport().kind}）`,
+    labelOf: () => label,
     log: (...args) => log?.warn?.(...args),
   })
   ctx.effect(() => ctx.tools.register(tool), 'world-terminal: remote_terminal')
@@ -94,8 +85,5 @@ export function apply(ctx, config = {}) {
     trace('tools-after-register-failed', { error: String(error?.message ?? error) })
   }
 
-  log?.info?.(
-    '[world-terminal] 隔离域终端已挂载（档案 %s，类型 %s，根 %s）',
-    profileId, REMOTE_TERMINAL_TYPE, remoteRoot,
-  )
+  log?.info?.('[world-terminal] 隔离域终端已挂载（按 cwd 路由，类型 %s）', REMOTE_TERMINAL_TYPE)
 }

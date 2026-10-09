@@ -16,7 +16,7 @@ import { mkdtemp, rm, mkdir, writeFile, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { mergeAllowBuilds, readBundles, parseArgs, resolveDshHome, isPlaceholderDecision, BUILD_SCRIPT_DECISIONS, PACKAGE_NAME } from '../scripts/install.mjs'
+import { mergeAllowBuilds, readBundles, parseArgs, resolveDshHome, isPlaceholderDecision, installFailureHint, BUILD_SCRIPT_DECISIONS, PACKAGE_NAME } from '../scripts/install.mjs'
 
 async function withTempDir(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'installer-test-'))
@@ -217,4 +217,26 @@ test('resolveDshHome：显式 > 环境变量 > ~/.dsh', () => {
     else process.env.DSH_HOME = saved
   }
   // 负对照：忽略 DSH_HOME，会往用户的 ~/.dsh 写东西（动了错误的 profile）
+})
+
+test('installFailureHint：找不到 `dsh` 时**不列 pnpm 的原因**（实测踩到过）', () => {
+  const options = { bin: 'dsh', profile: 'dev', workspaceFile: '/p/pnpm-workspace.yaml' }
+
+  // ① 命令根本没跑起来（spawn ENOENT）—— 实测：DSH Desktop 的 CLI 在安装目录下，
+  //    通常不在 PATH 里，于是陌生人第一次装就撞这个。
+  const enoent = installFailureHint({ code: 1, error: { code: 'ENOENT' } }, options)
+  assert.match(enoent, /找不到 `dsh`/, '要点名「找不到这个命令」')
+  assert.match(enoent, /跟 pnpm 无关/, '要明确排除 pnpm —— 否则用户去改 workspace 文件，怎么改都不对')
+  assert.match(enoent, /--bin/, '要给出可操作的下一步')
+  assert.match(enoent, /resources\/runtime\/cli\/bin\/dsh/, '要指出 DSH Desktop 的 CLI 在哪')
+  assert.ok(!enoent.includes('ERR_PNPM_'), '**不许**再列 pnpm 的原因')
+
+  // ② 命令跑了但失败（pnpm 拒绝构建脚本等）—— 这时才该列 pnpm 的原因
+  const failed = installFailureHint({ code: 1 }, options)
+  assert.match(failed, /非零退出码结束/)
+  assert.match(failed, /ERR_PNPM_IGNORED_BUILDS/)
+  assert.match(failed, /ERR_PNPM_EPERM/)
+  assert.ok(!failed.includes('找不到'), '这条不是「找不到命令」，不许混淆')
+
+  // 负对照：两种情况共用一个提示 → 至少一边会把人指错方向
 })

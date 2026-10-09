@@ -15,10 +15,17 @@ import { fileURLToPath } from 'node:url'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 
-/** 递归收集文件（跳过 .git / node_modules）。 */
+/**
+ * 递归收集文件（跳过 .git / node_modules / 常见本地产物）。
+ *
+ * ⚠️ 产物必须跳过：`npm pack` 生成的 tarball、日志、编辑器备份都**不在仓库里**，
+ * 扫进来只会让「跑过一次 pack 的人」看到莫名其妙的失败 ——
+ * 实测：tarball 的二进制内容碰巧匹配上了「内部编号」那条检查。
+ */
 function walk(dir, out = []) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (entry.name === '.git' || entry.name === 'node_modules') continue
+    if (/\.(tgz|log|tmp|bak)$/.test(entry.name) || entry.name.endsWith('~')) continue
     const full = join(dir, entry.name)
     if (entry.isDirectory()) walk(full, out)
     else out.push(full)
@@ -200,6 +207,21 @@ test('仓库里不该有内部材料混入', () => {
   for (const name of ['AGENTS.md', 'docs', 'requirements', 'references', 'notes', '.devhome']) {
     assert.ok(!existsSync(join(ROOT, name)), `仓库内不该出现 ${name}（按约定它在仓库外）`)
   }
+})
+
+test('对外文件里不能出现内部编号（决策 D-xxx / 需求 R-xxxx / 里程碑 Mx）', () => {
+  // 这些编号指向**仓库外的内部材料**（决策记录、需求文档、里程碑规划），
+  // 外部读者查不到 —— 在注释里写「见某个内部编号」等于什么都没说。
+  // 理由本身要写在注释里，但**不要留一个查不到的编号**。
+  //
+  // ⚠️ 测试文件也一起查：`test/` 同样是发布出去的内容。
+  const ids = /\bD-\d{3}\b|\bR-\d{4}\b|\bM[1-5]\b/
+  for (const file of files) {
+    const rel = relative(ROOT, file)
+    const hit = readFileSync(file, 'utf8').match(ids)
+    assert.ok(!hit, `${rel} 出现内部编号 ${hit?.[0]} —— 外部读者查不到，改成自解释的说法`)
+  }
+  // 负对照：只在注释里留编号、不写理由 → 读者无从查起，等于没说
 })
 
 test('客户端半边必须是懒 CJS 形态', () => {

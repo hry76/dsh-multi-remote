@@ -13,11 +13,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
-  presetIdFor,
   buildPresetDefinition,
   validatePresetDefinition,
   isModuleSpecifier,
   PresetRegistry,
+  PRESET_ID,
   PRESET_ID_PREFIX,
   PLUGIN_PACKAGE,
   ISOLATED_SERVICES,
@@ -60,23 +60,10 @@ function fakeAgentPresets(options = {}) {
   }
 }
 
-test('presetIdFor：稳定、区分档案与远程根、前缀正确', () => {
-  const a = presetIdFor('conn-1', '/home/user/proj')
-  assert.equal(a, presetIdFor('conn-1', '/home/user/proj'), '同一输入必须稳定')
-  assert.notEqual(a, presetIdFor('conn-2', '/home/user/proj'), '不同档案必须不同')
-  assert.notEqual(a, presetIdFor('conn-1', '/home/user/other'), '不同远程根必须不同')
-  assert.match(a, new RegExp(`^${PRESET_ID_PREFIX}-conn-1-[0-9a-f]{12}$`))
-
-  assert.throws(() => presetIdFor('', '/x'), /非空/)
-  assert.throws(() => presetIdFor('c', ''), /非空/)
-  // 负对照：id 只由 profileId 派生时，同一台机器的两个项目会共用一个预设 →
-  // 两个项目的会话会共用同一个隔离域，文件操作落到错误的项目根
-})
-
-test('presetIdFor：id 里不能出现点号（参考项目实测会让插件树加载失败）', () => {
-  const id = presetIdFor('conn.with.dots', '/home/user/proj')
-  assert.ok(!id.includes('.'), `id 不该含点号：${id}`)
-  // 负对照：不替换非法字符，`conn.with.dots` 会原样进 id
+test('PRESET_ID：单一远程模式的固定 id，稳定且带前缀', () => {
+  assert.equal(PRESET_ID, 'multi-remote')
+  assert.match(PRESET_ID, new RegExp(`^${PRESET_ID_PREFIX}$`))
+  // 负对照：id 按「档案+远程根」派生 → 每个项目一个预设，模式列表出现 N 个「远程模式」
 })
 
 test('isModuleSpecifier：放行包名与包子路径，拒绝路径与 URL', () => {
@@ -97,7 +84,7 @@ test('isModuleSpecifier：放行包名与包子路径，拒绝路径与 URL', ()
 })
 
 test('buildPresetDefinition：行 name 是可解析的模块 specifier，绝不是文件路径', () => {
-  const definition = buildPresetDefinition({ profileId: 'conn-1', remoteRoot: '/home/user/proj' })
+  const definition = buildPresetDefinition()
   const group = definition.plugins[0]
   assert.equal(group.name, 'cordis:group')
   assert.equal(group.group, true)
@@ -107,13 +94,14 @@ test('buildPresetDefinition：行 name 是可解析的模块 specifier，绝不�
   for (const row of group.config) {
     if (!row.name.startsWith(`${PLUGIN_PACKAGE}/`)) continue
     assert.ok(isModuleSpecifier(row.name), `行的 name 必须是模块 specifier：${row.name}`)
-    assert.equal(row.config.profileId, 'conn-1')
-    assert.equal(row.config.remoteRoot, '/home/user/proj')
+    // 方案 A：provider 行**不再注入 profileId/remoteRoot**（按路径动态路由）
+    assert.equal(row.config, undefined, `provider 行不再注入 config：${row.name}`)
   }
   for (const row of ISOLATED_TOOL_ROWS) {
     assert.ok(isModuleSpecifier(row.name), `工具行的 name 也必须是模块 specifier：${row.name}`)
   }
   assert.deepEqual(validatePresetDefinition(definition), [], '构造出来的定义必须自洽')
+  assert.equal(definition.id, PRESET_ID, '预设 id 固定为单一远程模式')
   // 负对照：把行 name 换成 path.join(__dirname, ...)，validatePresetDefinition 会报错
 })
 
@@ -124,7 +112,7 @@ test('buildPresetDefinition：shell 工具必须在隔离域内注册（否则�
   //
   // 反过来说：不在域内注册工具，远程会话就**根本没有能跑命令的工具**
   // （默认预设的 tool-pwsh/tool-bash 随它自己的 scope 走，不在我们域内）。
-  const definition = buildPresetDefinition({ profileId: 'c', remoteRoot: '/r' })
+  const definition = buildPresetDefinition()
   const group = definition.plugins[0]
   const toolRows = group.config.filter((row) => !row.name.startsWith(`${PLUGIN_PACKAGE}/`))
 
@@ -142,39 +130,31 @@ test('buildPresetDefinition：shell 工具必须在隔离域内注册（否则�
   // 而真实后果是「已连上远程的会话把命令跑在本机」
 })
 
-test('buildPresetDefinition：bash 工具行的 cwd 必须指向远程根', () => {
-  // 工具的默认 cwd 是**会话工作目录**，也就是本机锚点目录 ——
-  // 那个路径在远程根本不存在。实测报错是远程 bash 的
-  // `cd: D:\...\anchor: 没有那个文件或目录`。
-  // 所以必须显式把 cwd 配成远程根。
-  const definition = buildPresetDefinition({ profileId: 'c', remoteRoot: '/home/user/proj' })
+test('buildPresetDefinition：bash 工具行不再注入 cwd（靠 world-shell 按锚点路由）', () => {
+  // 方案 A：单一远程模式没有固定的远程根，无法给 bash 配一个 cwd。
+  // 改为**不注入 cwd** —— tool-bash 默认用会话 cwd（本机锚点目录），
+  // world-shell 会把它翻译成远程根并路由到正确连接（实测那条翻译路径已通）。
+  const definition = buildPresetDefinition()
   const rows = definition.plugins[0].config
 
   const bash = rows.find((row) => row.name === '@deepseek-ai/dsh-tool-bash')
   assert.ok(bash !== undefined, '必须有 bash 工具行')
-  assert.equal(bash.config?.cwd, '/home/user/proj', 'bash 的 cwd 必须是远程根')
-  assert.ok(!String(bash.config?.cwd).includes(':'), 'cwd 不能是 Windows 路径（那是本机锚点）')
-
-  // 任何**带了 cwd** 的行都不许是本机锚点路径
-  for (const row of rows) {
-    if (row.config?.cwd === undefined) continue
-    assert.ok(!String(row.config.cwd).includes(':'), `${row.id} 的 cwd 不能是 Windows 路径`)
-  }
-  // 负对照：不配 cwd，bash 会用会话工作目录（本机锚点路径），远程 cd 直接失败
+  assert.equal(bash.config, undefined, 'bash 不再注入固定 cwd（单一远程模式没有唯一远程根）')
+  // 负对照：硬塞一个 cwd 会让 bash 在错误的项目根跑（单预设不知道该填哪个）
 })
 
-// ── R-0006：预设必须与宿主默认预设对齐（2026-10-07 实测发现的大缺口）──────
+// ── 预设必须与宿主默认预设对齐（2026-10-07 实测发现的大缺口）──────
 //
 // 原来只有 5 行（pty + 3 个 provider + tool-bash），于是**远程会话里模型只有
 // bash 和终端**：不能读文件、不能写文件、不能编辑、不能搜索，也读不到 AGENTS.md。
 // 为什么之前 4 次真机端到端都没发现：判据一直是「用 **bash 工具**跑一条命令」，
 // 而 bash 恰好是挂上的那个 —— 「文件工具没挂」从来没被触发过。
 
-test('R-0006：读/写/编辑工具（tool-fs）必须在隔离域内 —— 否则改的是本机', () => {
+test('读/写/编辑工具（tool-fs）必须在隔离域内 —— 否则改的是本机', () => {
   // `tool-fs` 只注入 `fs`。挂在隔离域内 → 拿到我们的远程实现；
   // 挂在域外 → 拿到全局（本机）实现 → **改的是本地镜像，远程毫无变化**。
   // 这正是本项目最怕的失败模式：看起来成功了，其实什么都没落到远程。
-  const definition = buildPresetDefinition({ profileId: 'c', remoteRoot: '/r', anchorPath: 'D:/a/mr-x' })
+  const definition = buildPresetDefinition()
   const rows = definition.plugins[0].config
   const fsTool = rows.find((row) => row.name === '@deepseek-ai/dsh-tool-fs')
 
@@ -191,9 +171,9 @@ test('R-0006：读/写/编辑工具（tool-fs）必须在隔离域内 —— 否
   //          真实后果是「模型以为改了远程，其实只改了本地镜像」
 })
 
-test('R-0006：预设必须覆盖默认预设里的各项能力（逐项对照）', () => {
+test('预设必须覆盖默认预设里的各项能力（逐项对照）', () => {
   // 宿主的默认预设 `ptc` 有 13 行。我们**不要求逐字一样**，但能力不能缺。
-  const definition = buildPresetDefinition({ profileId: 'c', remoteRoot: '/r' })
+  const definition = buildPresetDefinition()
   const names = new Set()
   const collect = (rows) => {
     for (const row of rows ?? []) {
@@ -236,8 +216,8 @@ test('R-0006：预设必须覆盖默认预设里的各项能力（逐项对照�
   assert.ok(required.length >= 9)
 })
 
-test('R-0006：计划模式要按默认预设那样单独 isolate 一层', () => {
-  const definition = buildPresetDefinition({ profileId: 'c', remoteRoot: '/r' })
+test('计划模式要按默认预设那样单独 isolate 一层', () => {
+  const definition = buildPresetDefinition()
   const planning = definition.plugins[0].config.find((row) => row.id === 'planning')
   assert.ok(planning !== undefined, '要有 planning 组')
   assert.equal(planning.name, 'cordis:group')
@@ -254,7 +234,7 @@ test('R-0006：计划模式要按默认预设那样单独 isolate 一层', () =>
 test('buildPresetDefinition：provider 必须排在工具行之前', () => {
   // 工具在注册时就要解析 ctx.shell。provider 排在后面的话，
   // 工具可能先解析到全局实现（本机），随后才轮到我们的 provider 上线。
-  const definition = buildPresetDefinition({ profileId: 'c', remoteRoot: '/r' })
+  const definition = buildPresetDefinition()
   const rows = definition.plugins[0].config
   const fsIndex = rows.findIndex((row) => row.name.endsWith('/world/fs.js'))
   const shellIndex = rows.findIndex((row) => row.name.endsWith('/world/shell.js'))
@@ -265,12 +245,12 @@ test('buildPresetDefinition：provider 必须排在工具行之前', () => {
   // 负对照：把工具行插到最前面，顺序断言变红
 })
 
-test('R-0006：预设里引用的每个本插件子路径都必须在 package.json 的 exports 里登记', () => {
+test('预设里引用的每个本插件子路径都必须在 package.json 的 exports 里登记', () => {
   // 实测踩到过：新增 `world/search.js` 这一行后忘了往 `package.json` 的
   // `exports` 加对应条目 —— 宿主解析不到模块，该行报 **`never started`**，
   // 而**整行 broken 会让整个预设激活失败**（我们的 fail-loud 直接拒绝建连）。
   // 症状很难猜（不报「文件不存在」，只说 never started），所以静态拦住。
-  const definition = buildPresetDefinition({ profileId: 'c', remoteRoot: '/r', anchorPath: '/tmp/a' })
+  const definition = buildPresetDefinition()
   const specifiers = new Set()
   const collect = (rows) => {
     for (const row of rows ?? []) {
@@ -297,7 +277,7 @@ test('R-0006：预设里引用的每个本插件子路径都必须在 package.js
 })
 
 test('validatePresetDefinition：抓出绝对路径、相对路径与点号 id', () => {
-  const base = buildPresetDefinition({ profileId: 'c', remoteRoot: '/r' })
+  const base = buildPresetDefinition()
 
   const withAbsolute = structuredClone(base)
   withAbsolute.plugins[0].config[0].name = 'D:/Users/someone/plugin/src/world/fs.js'
@@ -322,13 +302,11 @@ test('validatePresetDefinition：抓出绝对路径、相对路径与点号 id',
 })
 
 test('PresetRegistry：注册后回读诊断，激活失败必须可见', async () => {
-  const agentPresets = fakeAgentPresets({ brokenIds: ['multi-remote-conn-1-aaaaaaaaaaaa'] })
+  const agentPresets = fakeAgentPresets({ brokenIds: [PRESET_ID] })
   const warnings = []
   const registry = new PresetRegistry({ agentPresets, log: (message, ...rest) => warnings.push([message, ...rest]) })
 
-  const definition = buildPresetDefinition({ profileId: 'conn-1', remoteRoot: '/home/user/proj' })
-  // 让 id 恰好命中我们预设的「坏」集合
-  definition.id = 'multi-remote-conn-1-aaaaaaaaaaaa'
+  const definition = buildPresetDefinition()
 
   const diagnostic = await registry.register(definition)
   assert.equal(diagnostic.present, true)
@@ -344,7 +322,7 @@ test('PresetRegistry：干净注册时可用，且不写 warn', async () => {
   const warnings = []
   const registry = new PresetRegistry({ agentPresets, log: (message, ...rest) => warnings.push([message, ...rest]) })
 
-  const definition = buildPresetDefinition({ profileId: 'conn-1', remoteRoot: '/home/user/proj' })
+  const definition = buildPresetDefinition()
   const diagnostic = await registry.register(definition)
 
   assert.equal(diagnostic.usable, true)
@@ -358,7 +336,7 @@ test('PresetRegistry：干净注册时可用，且不写 warn', async () => {
 test('PresetRegistry.assertUsable：不可用时抛错，绝不返回「看起来能用」', async () => {
   const agentPresets = fakeAgentPresets()
   const registry = new PresetRegistry({ agentPresets })
-  const definition = buildPresetDefinition({ profileId: 'conn-1', remoteRoot: '/home/user/proj' })
+  const definition = buildPresetDefinition()
   await registry.register(definition)
 
   // 注册表里没有 → 抛错
@@ -379,7 +357,7 @@ test('PresetRegistry.assertUsable：不可用时抛错，绝不返回「看起�
 test('PresetRegistry：重复注册同一个 id 直接抛错', async () => {
   const agentPresets = fakeAgentPresets()
   const registry = new PresetRegistry({ agentPresets })
-  const definition = buildPresetDefinition({ profileId: 'conn-1', remoteRoot: '/home/user/proj' })
+  const definition = buildPresetDefinition()
   await registry.register(definition)
 
   await assert.rejects(() => registry.register(definition), /已经注册过/)
@@ -390,7 +368,7 @@ test('PresetRegistry：重复注册同一个 id 直接抛错', async () => {
 test('PresetRegistry：注销干净，且可以从注册表移除', async () => {
   const agentPresets = fakeAgentPresets()
   const registry = new PresetRegistry({ agentPresets })
-  const definition = buildPresetDefinition({ profileId: 'conn-1', remoteRoot: '/home/user/proj' })
+  const definition = buildPresetDefinition()
   await registry.register(definition)
   assert.deepEqual(registry.registeredIds, [definition.id])
 
@@ -404,15 +382,29 @@ test('PresetRegistry：注销干净，且可以从注册表移除', async () => 
   // 重新挂载时撞 Duplicate agent preset
 })
 
+test('PresetRegistry.ensureRegistered：幂等 —— 多个连接共享同一份预设，只注册一次', async () => {
+  const agentPresets = fakeAgentPresets()
+  const registry = new PresetRegistry({ agentPresets })
+  const definition = buildPresetDefinition()
+
+  const first = await registry.ensureRegistered(definition)
+  assert.equal(first.usable, true)
+  const second = await registry.ensureRegistered(definition)
+  assert.equal(second.usable, true)
+
+  assert.deepEqual(registry.registeredIds, [PRESET_ID], '只注册一份')
+  assert.equal(agentPresets.registerCalls.length, 1, '宿主的 register 只被调一次')
+  // 负对照：每次连接都 register 同一个 id → 第二个连接撞 Duplicate agent preset
+})
+
 test('PresetRegistry.unregisterAll：一次清干净，失败也继续', async () => {
   const agentPresets = fakeAgentPresets()
   const registry = new PresetRegistry({ agentPresets })
-  await registry.register(buildPresetDefinition({ profileId: 'c1', remoteRoot: '/r1' }))
-  await registry.register(buildPresetDefinition({ profileId: 'c2', remoteRoot: '/r2' }))
-  assert.equal(registry.registeredIds.length, 2)
+  await registry.register(buildPresetDefinition())
+  assert.equal(registry.registeredIds.length, 1)
 
   const summary = await registry.unregisterAll()
-  assert.equal(summary.removed, 2)
+  assert.equal(summary.removed, 1)
   assert.equal(summary.failed, 0)
   assert.deepEqual(registry.registeredIds, [])
   // 负对照：用串行 await 且不 catch，第一个失败会让后面的预设留在注册表里

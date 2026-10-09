@@ -11,13 +11,15 @@
  * 预设没真的挂上却让用户建会话，agent 会在本机跑而界面显示已连上远程。
  */
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, basename } from 'node:path'
+import { rm } from 'node:fs/promises'
 
 import { Mirror, anchorDirectoryName } from '../mirror/index.js'
-import { buildPresetDefinition, presetIdFor } from './preset.js'
+import { buildPresetDefinition, PRESET_ID } from './preset.js'
 import { normalizeProfile, describeProfile, anchorPathOf } from './profile.js'
 import { verifyRemoteRoot } from './verify-root.js'
-import { registerTransport, unregisterTransport } from '../transport/registry.js'
+import { registerTransport, unregisterTransport, registerMirror, unregisterMirror } from '../transport/registry.js'
+import { registerWorkspaceRoute, unregisterWorkspaceRoute } from './workspace-routes.js'
 import { SshTransport, KnownHosts, HOST_KEY_RESULT, fingerprintFromKnownHostsKey } from '../transport/ssh.js'
 import { WslTransport } from '../transport/wsl.js'
 import { DockerTransport } from '../transport/docker.js'
@@ -69,7 +71,7 @@ export class RemoteWorkspace {
     this.presetDiagnostic = undefined
     this.connected = false
     /**
-     * 已知主机记录（TOFU）。M1 只存内存 —— 持久化与凭据保护是 M2 的事。
+     * 已知主机记录（TOFU）。**只存内存** —— 不落盘，重启即忘。
      * 可以由调用方注入（例如从用户已有的 `~/.ssh/known_hosts` 导入信任，
      * 避免对已知主机重复确认）。
      * @type {KnownHosts}
@@ -109,6 +111,7 @@ export class RemoteWorkspace {
 
     const profile = this.profile
     const report = { profileId: profile.id, steps: {} }
+    const onProgress = options.onProgress
 
     // ── 1. transport + 连通性 ────────────────────────────────────────────
     const transport = this.createTransport(profile, {
@@ -119,6 +122,7 @@ export class RemoteWorkspace {
     await transport.connect()
     this.transport = transport
     report.steps.connect = { ok: true, fingerprint: transport.observedFingerprint ?? null }
+    onProgress?.({ phase: 'connect' })
 
     // ── 1.5 校验远程项目根**存在**（真机事故换来的）──────────────────────
     // 用户把根填成一个不存在的路径 → 连接「成功」→ 之后每条命令都先 cd 到
@@ -126,6 +130,7 @@ export class RemoteWorkspace {
     // 路径是用户在界面上填的，就该**当场**验证，并把「同名目录在哪」直接告诉他。
     const verified = await verifyRemoteRoot(transport, profile.remoteRoot, { signal: options.signal })
     report.steps.verifyRoot = { ok: true, candidates: verified.candidates }
+    onProgress?.({ phase: 'verify' })
 
     // ── 2. 注册 transport（隔离域内的 provider 靠它取远程） ───────────────
     // 若同一 id 已注册，说明有泄漏的旧连接；先清掉再注册，避免静默覆盖。
@@ -142,8 +147,19 @@ export class RemoteWorkspace {
         profileId: profile.id,
         log: this.log,
       })
-      const mirrorReport = await mirror.init({ signal: options.signal })
+      const mirrorReport = await mirror.init({
+        signal: options.signal,
+        onProgress,
+      })
       this.mirror = mirror
+      // 镜像挂进注册表：隔离域里的 fs provider 靠它做「写后回写」
+      // （agent 改了远程，顺手把新内容同步进本地镜像，界面即时可见）。
+      registerMirror(profile.id, mirror)
+      // 工作区路由：单一「远程模式」的 provider 靠它按路径路由到正确的连接。
+      registerWorkspaceRoute(profile.id, {
+        remoteRoot: profile.remoteRoot,
+        anchorPath: this.anchorPath,
+      })
       report.steps.mirror = {
         anchorPath: mirrorReport.resolvedAnchor ?? this.anchorPath,
         written: mirrorReport.written ?? 0,
@@ -156,23 +172,12 @@ export class RemoteWorkspace {
         gitCommitted: mirrorReport.gitCommitted,
       }
 
-      // ── 4. 预设注册 + 回读诊断 ─────────────────────────────────────────
-      this.presetId = presetIdFor(profile.id, profile.remoteRoot)
-      // 展示用的「这是哪台机器」：SSH 给 host，WSL 给发行版，Docker 给容器名
-      const where = profile.kind === 'wsl'
-        ? `WSL ${profile.distro}`
-        : profile.kind === 'docker'
-          ? `容器 ${profile.container}`
-          : profile.host
-      const definition = buildPresetDefinition({
-        profileId: profile.id,
-        remoteRoot: profile.remoteRoot,
-        name: `远程：${profile.label}（${where}）`,
-        description: `文件与命令在 ${where}:${profile.remoteRoot} 执行`,
-        // 锚点目录：会话 cwd 就是它，域内 shell 靠它把本机路径翻译成远程路径
-        anchorPath: this.anchorPath,
-      })
-      const diagnostic = await options.presetRegistry.register(definition)
+      // ── 4. 预设（**单一「远程模式」**，幂等注册）+ 回读诊断 ────────────
+      // 方案 A：预设收敛成一个（id 固定 PRESET_ID），多个连接**共享**这一份。
+      // 这里只 ensureRegistered（第一个连接注册，后续复用），并把「预设可用吗」
+      // 回读进报告 —— 预设坏了要 fail-loud，不让用户建一个「假远程」会话。
+      this.presetId = PRESET_ID
+      const diagnostic = await options.presetRegistry.ensureRegistered(buildPresetDefinition())
       this.presetDiagnostic = diagnostic
       report.steps.preset = {
         id: diagnostic.id,
@@ -180,6 +185,7 @@ export class RemoteWorkspace {
         usable: diagnostic.usable,
         broken: diagnostic.broken ?? null,
       }
+      onProgress?.({ phase: 'preset' })
 
       // **绝不静默降级**：预设不可用就断开，而不是让用户建一个「假远程」会话。
       if (!diagnostic.usable) {
@@ -201,13 +207,32 @@ export class RemoteWorkspace {
 
       return report
     } catch (error) {
-      // 任何一步失败都要把已建立的资源收干净，不留半截状态
+      // 任何一步失败都要把已建立的资源收干净，不留半截状态。
+      // 清理失败**不能覆盖**真正的错误 —— 下面把原始 error 记进 report。
       await this.disconnect().catch(() => {})
+      // 失败/取消时**删掉半截锚点目录**：用户点了取消，已经同步下来的文件夹
+      // 就是废数据，留着只会让下次重连拿到一个不完整的镜像。
+      await this.removeAnchor().catch(() => {})
       report.ok = false
       report.error = String(error?.message ?? error)
       report.code = error?.code ?? null
       throw Object.assign(new Error(report.error), { report, code: report.code })
     }
+  }
+
+  /**
+   * 删掉本工作区的锚点目录（**破坏性**，仅用于「连接失败 / 用户取消」的清理）。
+   *
+   * 与 `disconnect()` 的区别：disconnect 刻意**保留**锚点（重连复用）；
+   * 这里相反 —— 半截镜像没有价值，留着只会误导下一次打开。
+   * 防护：只删名字以 `mr-` 开头的目录（`anchorDirectoryName` 保证），
+   * 万一 anchorPath 被外部改坏也不会误删别的。
+   */
+  async removeAnchor() {
+    const anchorPath = this.anchorPath
+    if (anchorPath === undefined) return
+    if (!basename(anchorPath).startsWith('mr-')) return
+    await rm(anchorPath, { recursive: true, force: true })
   }
 
   /**
@@ -260,13 +285,16 @@ export class RemoteWorkspace {
     // 先停后台补拉：连接都要断了，继续读远程只会产生一串无意义的失败
     this.deepenController?.abort()
 
-    // 1. 注销 transport（隔离域内的 provider 立刻拿不到远程 → 明确报错，不会回退本机）
+    // 1. 注销 transport / mirror / 工作区路由（隔离域内的 provider 立刻拿不到远程 → 明确报错，不会回退本机）
     unregisterTransport(this.profile.id)
+    unregisterMirror(this.profile.id)
+    unregisterWorkspaceRoute(this.profile.id)
 
     // 2. 断开连接
     const transport = this.transport
     this.transport = undefined
     if (transport !== undefined) {
+      // 收尾路径：断开失败没有可补救的动作，也不该覆盖调用方的结果
       await transport.disconnect().catch(() => {})
     }
   }
@@ -357,10 +385,9 @@ export class ConnectionManager {
     const workspace = this.workspaces.get(String(profileId ?? '').trim())
     if (workspace === undefined) return false
     this.workspaces.delete(workspace.profile.id)
-    // 预设要先注销：否则重新连接会撞 Duplicate agent preset
-    if (workspace.presetId !== undefined) {
-      await this.presetRegistry.unregister(workspace.presetId).catch(() => {})
-    }
+    // 方案 A：预设是**单一的「远程模式」**，多个连接共享、且常驻 ——
+    // 断开单个连接**不注销预设**（否则其它连接/历史会话的预设会消失）。
+    // 预设只在插件卸载时由 `presetRegistry.unregisterAll()` 注销。
     await workspace.disconnect()
     return true
   }

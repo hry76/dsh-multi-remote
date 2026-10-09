@@ -27,6 +27,8 @@ import {
   DEFAULT_MAX_RESULTS,
 } from '../src/world/search.js'
 import { WslTransport } from '../src/transport/wsl.js'
+import { registerTransport, clearTransports } from '../src/transport/registry.js'
+import { registerWorkspaceRoute, clearWorkspaceRoutes } from '../src/session/workspace-routes.js'
 
 // ── 1. 纯逻辑 ────────────────────────────────────────────────────────────────
 
@@ -260,17 +262,25 @@ test('搜索超时：返回已找到的部分结果，并如实标注不完整',
     effect: (fn) => { fn(); return () => {} },
     shell: fakeShell,
   }
-  apply(ctx, { profileId: 'p', remoteRoot: '/r' })
+  apply(ctx, {})
+  // 方案 A：search 按路径路由，测试要注册一个工作区路由（transport 只需存在，search 走 fakeShell）
+  registerTransport('search-test', { kind: 'ssh' })
+  registerWorkspaceRoute('search-test', { remoteRoot: '/r', anchorPath: 'D:/a/mr-x' })
 
-  const globTool = registered.find((definition) => definition.name === 'glob')
-  assert.ok(globTool !== undefined, '应当注册 glob')
+  try {
+    const globTool = registered.find((definition) => definition.name === 'glob')
+    assert.ok(globTool !== undefined, '应当注册 glob')
 
-  const out = await globTool.execute({ pattern: '*.ts' }, {})
-  assert.equal(out.partial, true, '超时要标 partial')
-  assert.deepEqual(out.paths, ['a.ts', 'src/b.ts'], '已找到的部分要带回来，不能丢')
+    const out = await globTool.execute({ pattern: '*.ts', path: '/r' }, {})
+    assert.equal(out.partial, true, '超时要标 partial')
+    assert.deepEqual(out.paths, ['a.ts', 'src/b.ts'], '已找到的部分要带回来，不能丢')
 
-  const text = globTool.output.render({}, out)[0].text
-  assert.match(text, /可能不完整/, '必须如实告诉模型结果不完整')
+    const text = globTool.output.render({}, out)[0].text
+    assert.match(text, /可能不完整/, '必须如实告诉模型结果不完整')
+  } finally {
+    clearTransports()
+    clearWorkspaceRoutes()
+  }
   // 负对照：超时直接抛错 → 用户什么结果都没有，只看到一句「搜索超时」
 })
 
@@ -290,10 +300,18 @@ test('搜索超时且一条都没找到：要说明「没搜到 ≠ 不存在」
       }),
     },
   }
-  apply(ctx, { profileId: 'p', remoteRoot: '/r' })
-  const grepTool = registered.find((definition) => definition.name === 'grep')
-  const out = await grepTool.execute({ pattern: 'x' }, {})
-  const text = grepTool.output.render({}, out)[0].text
-  assert.match(text, /不等于「不存在」/, '超时的「没搜到」必须说清楚，不能让人以为真的没有')
+  apply(ctx, {})
+  registerTransport('search-test', { kind: 'ssh' })
+  registerWorkspaceRoute('search-test', { remoteRoot: '/r', anchorPath: 'D:/a/mr-x' })
+
+  try {
+    const grepTool = registered.find((definition) => definition.name === 'grep')
+    const out = await grepTool.execute({ pattern: 'x', path: '/r' }, {})
+    const text = grepTool.output.render({}, out)[0].text
+    assert.match(text, /不等于「不存在」/, '超时的「没搜到」必须说清楚，不能让人以为真的没有')
+  } finally {
+    clearTransports()
+    clearWorkspaceRoutes()
+  }
   // 负对照：只说「没有匹配」 → 模型据此断言「文件里没有这个字符串」，是错的
 })

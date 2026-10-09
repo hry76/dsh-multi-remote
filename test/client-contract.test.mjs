@@ -91,8 +91,12 @@ test('客户端：注册必须**同步**完成，不能写在异步回调里', (
     assert.ok(!region.includes(boundary), `注册块里出现 ${boundary} —— 异步注册会静默失效（实测踩过）`)
   }
 
-  // 开关必须**同步**可读：来自 apply 的 config，而不是等一次网络请求
-  assert.ok(client.includes('config.workspaceFlow !== false'), '开关从 config 同步读')
+  // 注册**无条件**进行：插件里**没有**「显示 / 隐藏入口」的开关。
+  // 插件的开与关由 DSH 自己管（插件管理器会写 `disabled: true`，整行不加载）——
+  // 自造第二个开关既多余，又半残（客户端在浏览器里，改配置要刷新页面才生效）。
+  assert.ok(!client.includes('workspaceFlow'), '不该再有自造的入口开关')
+  assert.ok(!/if \(enabled\)/.test(client), '注册不该被任何开关包住')
+  assert.ok(client.includes("report('inject-start'"), '无条件注册，直接上报')
 })
 
 test('客户端：每一步都要上报（浏览器里出问题我们看不到控制台）', () => {

@@ -32,6 +32,7 @@
  * 宿主按**清单声明的依赖**做裸包名路由；只 import 不声明会以 ERR_MODULE_NOT_FOUND 失败。
  */
 import { readFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
@@ -54,6 +55,8 @@ import {
   ROUTE_UI_MACHINE_OPEN,
   ROUTE_UI_MACHINE_DISCONNECT,
   ROUTE_UI_OPEN_WORKSPACE,
+  ROUTE_UI_OPEN_PROGRESS,
+  ROUTE_UI_OPEN_CANCEL,
   ROUTE_UI_SETTINGS,
   workspaceTitle,
   readJsonBody,
@@ -69,6 +72,15 @@ import { AuditLog } from './audit.js'
 
 /** 插件身份。必须与 cordis.patch.yml 里的包名、package.json 的 name 一致。 */
 export const name = '@jk-uzi/dsh-multi-remote'
+
+/**
+ * 解析请求 URL 用的**哑基址**。
+ *
+ * `new URL(path, base)` 需要一个绝对基址才能解析相对路径 —— 这里**不发起任何请求**，
+ * 所以用 RFC 2606 保留的 `.invalid` 顶级域：它保证解析不到任何真实主机，
+ * 一眼就能看出是个占位基址（而不是某台真实机器）。
+ */
+const PARSE_BASE = 'http://dsh.invalid'
 
 /**
  * 依赖的宿主服务。缺任何一个都不该挂载：
@@ -193,6 +205,15 @@ export function apply(ctx, config = {}) {
     ...config.createTransport === undefined ? {} : { createTransport: config.createTransport },
   })
 
+  /**
+   * 打开任务表：`taskId → { controller, status, progress, result, error }`。
+   *
+   * `machine-open` 任务化后，打开大项目不再是一个黑盒同步请求 —— 前端轮询
+   * `ROUTE_UI_OPEN_PROGRESS` 拿实时进度，点取消则 `abort()` 打断镜像阶段，
+   * 连接层 catch 到 ABORTED 后**删掉半截锚点**（见 `RemoteWorkspace.removeAnchor`）。
+   */
+  const openTasks = new Map()
+
   // 已连接但**还没选项目**的机器（「先连机器、再选文件夹」流程的第一步）。
   // 浏览用的连接是短命的：选好目录后由 connections 自己再建一条完整连接。
   const machines = new MachineRegistry({
@@ -233,7 +254,7 @@ export function apply(ctx, config = {}) {
     parameters: {
       id: { type: 'string', required: true, description: '连接档案标识（唯一，不能含点号）' },
       kind: { type: 'string', description: "后端类型：'ssh'（默认）/ 'wsl' / 'docker'" },
-      remoteRoot: { type: 'string', required: true, description: '远程项目根，绝对 POSIX 路径（如 /home/user/proj）' },
+      remoteRoot: { type: 'string', required: true, description: '远程项目根，绝对 POSIX 路径（如 /data/proj）' },
       anchorParent: { type: 'string', description: `本地锚点目录的父目录（默认 ${defaultAnchorParent()}）` },
       label: { type: 'string', description: '显示名' },
       distro: { type: 'string', description: "WSL 发行版名（kind='wsl' 时必填，如 Ubuntu-24.04）" },
@@ -490,7 +511,7 @@ export function apply(ctx, config = {}) {
       try {
         const inventory = await ctx.agentPresets.compositionInventory()
         presets = inventory
-          .filter((row) => typeof row.id === 'string' && row.id.startsWith('multi-remote-'))
+          .filter((row) => typeof row.id === 'string' && row.id.startsWith('multi-remote'))
           .map((row) => ({
             id: row.id,
             broken: row.broken ?? null,
@@ -503,7 +524,7 @@ export function apply(ctx, config = {}) {
       // 后端可用性：先回答「这台机器上哪种后端能用」，再谈具体连接。
       // `?backends=0` 可以跳过（探测要几秒，脚本里只想要工具状态时用得上）。
       let backends = null
-      if (new URL(req.url ?? '/', 'http://localhost').searchParams.get('backends') !== '0') {
+      if (new URL(req.url ?? '/', PARSE_BASE).searchParams.get('backends') !== '0') {
         try {
           backends = await probe()
         } catch (error) {
@@ -547,7 +568,7 @@ export function apply(ctx, config = {}) {
         sendJson(res, 405, { ok: false, error: 'method not allowed' })
         return
       }
-      const params = new URL(req.url ?? '/', 'http://localhost').searchParams
+      const params = new URL(req.url ?? '/', PARSE_BASE).searchParams
       const limit = params.get('limit')
       const event = params.get('event')
 
@@ -590,8 +611,11 @@ export function apply(ctx, config = {}) {
 
       sendJson(res, 200, {
         ok: true,
-        // 关掉之后 `+` 按钮完全恢复官方行为（见 cordis.patch.yml 的 config）
-        workspaceFlow: config.workspaceFlow !== false,
+        // ⚠️ 这里**没有**「显示 / 隐藏入口」的开关 —— 插件的开与关由 DSH 自己管
+        // （插件管理器关掉它时 loader 写 `disabled: true`，整行不加载）。
+        // 曾经有过一个 `workspaceFlow` 开关，那是给「接管 `+` 按钮」留的安全阀；
+        // 那条路已废弃，入口改成加法式之后这个开关既多余又半残（客户端在浏览器里，
+        // 改了配置要刷新页面才生效），已删除。
         anchorParent: defaultAnchorParent(),
         kinds: ['wsl', 'ssh', 'docker'],
         profiles: describeProfiles(typeof profileStoreDir === 'string' ? await listProfiles(profileStoreDir) : []),
@@ -804,31 +828,110 @@ export function apply(ctx, config = {}) {
         return
       }
 
-      try {
-        // 复用机器的档案（含凭据）＋ 选中的目录；**连接档案 id 按目录重新推导**
-        // —— 否则同一台机器上的第二个项目会撞 id（`档案 X 已经连接`）。
-        const input = {
-          ...machine.profile,
-          id: deriveConnectId(machine.kind, remoteRoot),
-          remoteRoot,
-          anchorParent: typeof body.anchorParent === 'string' && body.anchorParent !== '' ? body.anchorParent : defaultAnchorParent(),
-        }
-        const workspace = await connections.connect(input)
-        const described = workspace.describe()
-        const summary = describeConnected(described)
-        audit.record('connect-ok', { ...summary, via: 'ui-machine' })
-        sendJson(res, 200, { ok: true, ...summary, title: workspaceTitle(summary.kind, summary.remoteRoot) })
-      } catch (error) {
-        audit.record('connect-failed', {
-          via: 'ui-machine',
-          kind: machine.kind,
-          code: error?.code ?? null,
-          message: String(error?.message ?? error),
-        })
-        sendJson(res, 200, { ok: false, error: String(error?.message ?? error), code: error?.code ?? null })
+      // 复用机器的档案（含凭据）＋ 选中的目录；**连接档案 id 按目录重新推导**
+      // —— 否则同一台机器上的第二个项目会撞 id（`档案 X 已经连接`）。
+      const input = {
+        ...machine.profile,
+        id: deriveConnectId(machine.kind, remoteRoot),
+        remoteRoot,
+        anchorParent: typeof body.anchorParent === 'string' && body.anchorParent !== '' ? body.anchorParent : defaultAnchorParent(),
       }
+
+      // ── 任务化：启动连接任务，立即返回 taskId，前端轮询进度 / 可取消 ──
+      const taskId = randomUUID()
+      const controller = new AbortController()
+      const task = {
+        controller,
+        status: 'running',
+        progress: { phase: 'connect' },
+        result: null,
+        error: null,
+      }
+      openTasks.set(taskId, task)
+
+      // 后台跑连接（**不 await**），进度通过 onProgress 写进 task
+      ;(async () => {
+        try {
+          const workspace = await connections.connect(input, {
+            signal: controller.signal,
+            onProgress: (progress) => { task.progress = progress },
+          })
+          const summary = describeConnected(workspace.describe())
+          task.status = 'done'
+          task.result = { ...summary, title: workspaceTitle(summary.kind, summary.remoteRoot) }
+          audit.record('connect-ok', { ...summary, via: 'ui-machine' })
+        } catch (error) {
+          if (controller.signal.aborted) {
+            task.status = 'cancelled'
+            audit.record('connect-cancelled', { via: 'ui-machine', kind: machine.kind })
+          } else {
+            task.status = 'error'
+            task.error = String(error?.message ?? error)
+            audit.record('connect-failed', {
+              via: 'ui-machine',
+              kind: machine.kind,
+              code: error?.code ?? null,
+              message: String(error?.message ?? error),
+            })
+          }
+        } finally {
+          // 结果被取走后 5 分钟清理，避免任务表无限增长
+          setTimeout(() => { if (openTasks.get(taskId) === task) openTasks.delete(taskId) }, 5 * 60_000).unref?.()
+        }
+      })()
+
+      sendJson(res, 200, { ok: true, taskId })
     }),
   }), `${name}: ${ROUTE_UI_MACHINE_OPEN} 路由`)
+
+  // 打开进度：前端轮询，拿「走到哪一步」+ 最终结果/错误。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: ROUTE_UI_OPEN_PROGRESS,
+    handler: fenced(async (req, res) => {
+      const taskId = String(new URL(req.url ?? '/', PARSE_BASE).searchParams.get('task') ?? '')
+      const task = openTasks.get(taskId)
+      if (task === undefined) {
+        sendJson(res, 200, { ok: false, error: '任务不存在或已过期' })
+        return
+      }
+      sendJson(res, 200, {
+        ok: true,
+        status: task.status,
+        progress: task.progress,
+        result: task.result,
+        error: task.error,
+      })
+    }),
+  }), `${name}: ${ROUTE_UI_OPEN_PROGRESS} 路由`)
+
+  // 取消打开：abort 连接任务（镜像阶段立即中断，连接层删掉半截锚点）。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: ROUTE_UI_OPEN_CANCEL,
+    handler: fenced(async (req, res) => {
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      let body
+      try {
+        body = await readJsonBody(req, 8192)
+      } catch (error) {
+        sendJson(res, 400, { ok: false, error: String(error?.message ?? error) })
+        return
+      }
+      const taskId = String(body.taskId ?? '').trim()
+      const task = openTasks.get(taskId)
+      if (task === undefined) {
+        sendJson(res, 200, { ok: false, error: '任务不存在或已结束' })
+        return
+      }
+      task.controller.abort()
+      audit.record('connect-cancel-request', { taskId })
+      sendJson(res, 200, { ok: true })
+    }),
+  }), `${name}: ${ROUTE_UI_OPEN_CANCEL} 路由`)
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
@@ -848,7 +951,7 @@ export function apply(ctx, config = {}) {
       }
     }),
   }), `${name}: ${ROUTE_UI_MACHINE_DISCONNECT} 路由`)
-  // 把锚点目录建成工作区，并**起一个能看懂的名字**（`ssh:/home/user/my-proj/my-proj`）。
+  // 把锚点目录建成工作区，并**起一个能看懂的名字**（`ssh:/data/my-proj/my-proj`）。
   //
   // 为什么在宿主侧做：客户端要先 `ctx.get('workspaces')` 再创建，实测**拿不到** ——
   // 于是自动创建失败，界面退化成「请手工打开这个目录」的提示（用户看到的正是那句）。
@@ -936,7 +1039,6 @@ export function apply(ctx, config = {}) {
           ok: true,
           editable: canEdit,
           config: {
-            workspaceFlow: config.workspaceFlow !== false,
             auditCapacity: audit.read({ limit: 1 }).capacity,
             mirrorDeepen: {
               enabled: deepenCfg.enabled !== false,
@@ -992,7 +1094,6 @@ export function apply(ctx, config = {}) {
       try {
         await editor.edit(entry, (current) => {
           const next = { ...(current ?? {}) }
-          if (patch.workspaceFlow !== undefined) next.workspaceFlow = patch.workspaceFlow
           if (patch.auditCapacity !== undefined) next.auditCapacity = patch.auditCapacity
           if (patch.mirrorDeepen !== undefined) {
             const base = typeof next.mirrorDeepen === 'object' && next.mirrorDeepen !== null ? next.mirrorDeepen : {}

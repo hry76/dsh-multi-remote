@@ -10,7 +10,7 @@
  * 一旦这里静默回退到本机，用户会在界面上看到「已连上远程」，而文件其实读写在本机 ——
  * 这是本项目最坏的失败模式。所以：
  *
- *   - 拿不到 transport 就**抛错**，绝不回退（`requireTransport` 保证）。
+ *   - 拿不到路由（路径不属于任何已连接项目）就**抛错**，绝不回退（`routeFor` 保证）。
  *   - 契约里没实现的方法**抛错**，不返回 undefined 让上层猜。
  *
  * ## 契约（来自宿主 `dsh-fs` 与 `dsh-fs-local` 的公开方法）
@@ -26,9 +26,8 @@
  */
 import { posix } from 'node:path'
 
-import { requireTransport } from '../transport/registry.js'
+import { routeByRemotePath, translateToRemote, relativeToRoot } from '../session/workspace-routes.js'
 import { TRANSPORT_ERROR } from '../transport/transport.js'
-import { resolveRemotePath } from './translate.js'
 
 /** 宿主 `FsError` 的错误码子集（我们只产出这几个）。 */
 export const FS_ERROR = {
@@ -65,6 +64,8 @@ export class WorldFsError extends Error {
 
 /** 把 transport 的错误码映射成宿主 fs 的错误码。 */
 function mapTransportError(error, displayPath, verb) {
+  // 已经是 WorldFsError（如「路径不属于任何已连接项目」）→ 原样透传，不再包装
+  if (error instanceof WorldFsError) return error
   const code = error?.code
   const detail = error?.message ?? String(error)
   const at = displayPath === '' ? '' : ` "${displayPath}"`
@@ -112,46 +113,73 @@ export const name = '@jk-uzi/dsh-multi-remote/world-fs'
 /**
  * 隔离域里的 fs provider。
  *
- * `config.profileId` 指向连接档案；`config.remoteRoot` 是这台机器的项目根，
- * 用于把相对路径解析成绝对路径。
+ * **方案 A（单一远程模式）**：不再绑定固定的 profileId/remoteRoot —— 每次操作
+ * 按「远程路径」路由到对应工作区（`workspace-routes.js`）。一份预设服务所有
+ * 远程项目，且路径永远不会错发到另一个项目。
  */
 export function apply(ctx, config = {}) {
-  const profileId = config.profileId
-  const remoteRoot = config.remoteRoot
-  if (typeof profileId !== 'string' || profileId === '') {
-    throw new Error('world-fs: config.profileId 必填（拿不到就拒绝挂载，绝不回退到本机）')
-  }
-  if (typeof remoteRoot !== 'string' || !remoteRoot.startsWith('/')) {
-    throw new Error('world-fs: config.remoteRoot 必须是以 / 开头的绝对 POSIX 路径')
-  }
-
   const log = ctx.logger
-  const transport = () => requireTransport(profileId)
-
-  /** 本机锚点目录：会话 cwd 就是它，工具会把路径按它来传（与 world-shell 同一个坑）。 */
-  const localAnchorPath = typeof config.localAnchorPath === 'string' ? config.localAnchorPath : undefined
 
   /**
-   * 把任意输入路径解析成远程绝对 POSIX 路径。
+   * 由远程路径拿到所属工作区的 transport / mirror；拿不到就**报错**（绝不回退本机）。
+   */
+  const routeFor = (remotePath) => {
+    const routed = routeByRemotePath(remotePath)
+    if (routed === undefined) {
+      throw new WorldFsError(
+        `路径 "${remotePath}" 不属于任何已连接的远程项目（请先打开对应项目）`,
+        FS_ERROR.NOT_FOUND,
+        { displayPath: remotePath },
+      )
+    }
+    return routed
+  }
+
+  /**
+   * 把任意输入路径解析成远程绝对 POSIX 路径（并路由到所属工作区）。
    *
-   * ⚠️ **不能只判断「是不是以 / 开头」**：`tool-fs` 会把**会话 cwd**（= 本机锚点目录，
-   * 例如 `D:\...\anchors\mr-x`）传下来，模型也自然会用锚点形态的路径。
-   * 直接用的话会拼出 `D:/.../anchors/mr-x/src/a.js` 这种远程根本不存在的路径。
-   * 所以走共享翻译：锚点 → 远程根，锚点之下 → 远程根 + 相对部分。
+   * ⚠️ **不能只判断「是不是以 / 开头」**：`tool-fs` 会把**会话 cwd**（= 本机锚点目录）
+   * 传下来，模型也自然会用锚点形态的路径。直接拼会得到远程不存在的路径。
+   * 翻译 + 路由统一走 `translateToRemote`（见 workspace-routes.js）。
    */
   const toRemoteAbsolute = (path, cwd) => {
     const raw = String(path ?? '')
     if (raw === '') throw new WorldFsError('file_path must be a non-empty string', FS_ERROR.NOT_FOUND)
-    return resolveRemotePath(raw, {
-      remoteRoot,
-      localAnchorPath,
-      ...cwd === undefined ? {} : { cwd },
-      log,
-    })
+    try {
+      return translateToRemote(raw, { cwd })
+    } catch (error) {
+      if (error instanceof WorldFsError) throw error
+      throw new WorldFsError(error?.message ?? '无法确定远程路径', FS_ERROR.NOT_FOUND, { displayPath: raw })
+    }
   }
 
   /** 构造一个 target：`targetKey` 是远程真实路径，`displayPath` 给模型/界面看。 */
   const makeTarget = (remotePath) => ({ targetKey: remotePath, displayPath: remotePath })
+
+  /**
+   * **写后回写**：agent 改了远程文件，顺手把新内容同步进本地镜像 ——
+   * 否则界面的文件树和「拉下来的项目」会停留在打开那一刻的快照。
+   *
+   * 三条边界（每一条都是刻意的）：
+   *   - 只回写**项目根之内**的文件（靠路由结果的 relativeToRoot）
+   *   - **尽力而为**：回写失败只记日志，绝不影响写操作本身的成败
+   *   - 拿不到 mirror → 跳过
+   *
+   * @param {object} routed 路由结果（含 remoteRoot + mirror）
+   * @param {string} remotePath 远程绝对路径
+   * @param {string|Buffer} content 刚写进远程的内容（复用，不发额外请求）
+   */
+  const syncToMirror = (routed, remotePath, content) => {
+    const mirror = routed.mirror
+    if (mirror === undefined) return
+    const relPath = relativeToRoot(routed, remotePath)
+    if (relPath === undefined) return
+    mirror.photo(relPath, content).then((outcome) => {
+      if (outcome.result === 'failed') {
+        log?.warn?.('[world-fs] 镜像回写失败（不影响远程写入）：%s — %s', remotePath, outcome.error ?? '')
+      }
+    }).catch(() => {})
+  }
 
   /** 从 target 里取远程路径。 */
   const pathOf = (target) => {
@@ -170,21 +198,21 @@ export function apply(ctx, config = {}) {
 
     async resolve(path, opts = {}) {
       opts.signal?.throwIfAborted?.()
-      const absolute = toRemoteAbsolute(path, opts.cwd)
+      const { remotePath } = toRemoteAbsolute(path, opts.cwd)
       try {
         // 用 realpath 归一化（符号链接、`~` 之外的情况），失败则退回字面路径
-        const real = await transport().realpath(absolute, { signal: opts.signal })
+        const real = await routeFor(remotePath).transport.realpath(remotePath, { signal: opts.signal })
         return makeTarget(real)
       } catch (error) {
-        if (error?.code === TRANSPORT_ERROR.NOT_FOUND) return makeTarget(absolute)
-        throw mapTransportError(error, absolute, 'resolve')
+        if (error?.code === TRANSPORT_ERROR.NOT_FOUND) return makeTarget(remotePath)
+        throw mapTransportError(error, remotePath, 'resolve')
       }
     },
 
     async stat(target, signal) {
       const remotePath = pathOf(target)
       try {
-        const info = await transport().stat(remotePath, { signal })
+        const info = await routeFor(remotePath).transport.stat(remotePath, { signal })
         if (info === undefined) return undefined
         return { version: versionOf(info), type: typeOf(info), size: info.size ?? 0 }
       } catch (error) {
@@ -196,13 +224,14 @@ export function apply(ctx, config = {}) {
     async lstat(path, opts = {}, signal) {
       // 远程侧暂不区分 lstat / stat（SFTP 的 lstat 语义由 transport 决定）；
       // 这里显式走 stat 并保留注释，避免让人以为「已经处理了符号链接」。
-      return provider.stat(makeTarget(toRemoteAbsolute(path, opts.cwd)), signal)
+      const { remotePath } = toRemoteAbsolute(path, opts.cwd)
+      return provider.stat(makeTarget(remotePath), signal)
     },
 
     async readText(target, signal) {
       const remotePath = pathOf(target)
       try {
-        return await transport().readFile(remotePath, { encoding: 'utf8', signal })
+        return await routeFor(remotePath).transport.readFile(remotePath, { encoding: 'utf8', signal })
       } catch (error) {
         throw mapTransportError(error, remotePath, 'read')
       }
@@ -212,7 +241,7 @@ export function apply(ctx, config = {}) {
       const remotePath = pathOf(target)
       let entries
       try {
-        entries = await transport().readdir(remotePath, { signal })
+        entries = await routeFor(remotePath).transport.readdir(remotePath, { signal })
       } catch (error) {
         throw mapTransportError(error, remotePath, 'list')
       }
@@ -250,12 +279,14 @@ export function apply(ctx, config = {}) {
       }
 
       const before = current === undefined ? null : await provider.readText(target, signal).catch(() => null)
+      const routed = routeFor(remotePath)
       try {
-        await transport().writeFileAtomic(remotePath, content, { signal })
+        await routed.transport.writeFileAtomic(remotePath, content, { signal })
       } catch (error) {
         throw mapTransportError(error, remotePath, 'write')
       }
       const after = await provider.stat(target, signal).catch(() => undefined)
+      syncToMirror(routed, remotePath, content)
       return {
         operation: current === undefined ? 'create' : 'update',
         version: after?.version ?? '',
@@ -279,12 +310,14 @@ export function apply(ctx, config = {}) {
 
       const original = await provider.readText(target, signal)
       const edited = applyLiteralEdit(original, edit, remotePath)
+      const routed = routeFor(remotePath)
       try {
-        await transport().writeFileAtomic(remotePath, edited.content, { signal })
+        await routed.transport.writeFileAtomic(remotePath, edited.content, { signal })
       } catch (error) {
         throw mapTransportError(error, remotePath, 'edit')
       }
       const after = await provider.stat(target, signal).catch(() => undefined)
+      syncToMirror(routed, remotePath, edited.content)
       return { version: after?.version ?? '', before: original, after: edited.content }
     },
 
@@ -322,7 +355,7 @@ export function apply(ctx, config = {}) {
   }
 
   ctx.provide('fs', provider)
-  log?.info?.('[world-fs] 隔离域 fs 已挂载（档案 %s，根 %s）', profileId, remoteRoot)
+  log?.info?.('[world-fs] 隔离域 fs 已挂载（按路径路由，不绑固定连接）')
 }
 
 /**

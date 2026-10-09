@@ -68,3 +68,53 @@ export function clearTransports() {
   transports.clear()
   return count
 }
+
+/**
+ * Mirror 注册表 —— 把「连接档案」映射到活的镜像实例。
+ *
+ * 与 transport 注册表同一个存在理由：隔离域里的 fs provider 需要拿到
+ * 「这个连接档案对应的镜像」做**写后回写**（agent 改了远程，界面即时可见）。
+ *
+ * 与 transport 的关键区别：mirror 是**可选**的 —— 回写失败/缺失不影响 agent
+ * 的任何操作（镜像只是照片，agent 从不读它）。所以这里提供 `lookupMirror`
+ * （拿不到返回 undefined），而不是 `requireMirror`。
+ */
+
+/** @type {Map<string, import('../mirror/index.js').Mirror>} */
+const mirrors = new Map()
+
+/**
+ * 注册一个 mirror。同一 profileId 重复注册会抛错（与 transport 同一防覆盖语义）。
+ * @param {string} profileId
+ * @param {import('../mirror/index.js').Mirror} mirror
+ */
+export function registerMirror(profileId, mirror) {
+  const key = String(profileId ?? '').trim()
+  if (key === '') throw new Error('registerMirror 需要非空的 profileId')
+  if (mirror === undefined || mirror === null) throw new Error('registerMirror 需要 mirror 实例')
+  if (mirrors.has(key)) {
+    throw new Error(`连接档案 ${key} 已经注册过 mirror（静默覆盖会让回写发往错误的镜像）`)
+  }
+  mirrors.set(key, mirror)
+}
+
+/**
+ * 取一个 mirror —— **可选**：拿不到返回 `undefined`，调用方跳过回写即可。
+ * @param {string} profileId
+ * @returns {import('../mirror/index.js').Mirror|undefined}
+ */
+export function lookupMirror(profileId) {
+  return mirrors.get(String(profileId ?? '').trim())
+}
+
+/** 注销一个 mirror（断开连接时调用）。 */
+export function unregisterMirror(profileId) {
+  return mirrors.delete(String(profileId ?? '').trim())
+}
+
+/** 清空 mirror 注册表（测试与插件卸载用）。 */
+export function clearMirrors() {
+  const count = mirrors.size
+  mirrors.clear()
+  return count
+}

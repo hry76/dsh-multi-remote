@@ -1,7 +1,7 @@
 /**
  * 格局层 —— 打开工作区时，把远程的**目录结构**（以及小文件内容）拉进锚点目录。
  *
- * 目标（对应 D-017 的「格局层」）：
+ * 目标（「格局层」）：
  *   - 文件树能显示远程目录结构
  *   - `@` 补全能列出远程文件
  *   - 小文本文件顺带拉内容；大文件只留占位
@@ -87,6 +87,7 @@ async function localIsPlaceholder(localPath) {
     // 读不到就当「不是占位」—— 后面的逻辑会因为文件不存在而正常补拉
     return false
   } finally {
+    // 关句柄失败不影响结果：这里已是收尾路径，真正的错误在上面已经抛/返回了
     await handle?.close().catch(() => {})
   }
 }
@@ -292,6 +293,20 @@ export async function walkRemoteTree(options) {
  * 与遍历分开的理由：遍历是纯逻辑（可假 transport 单测），落盘涉及围栏与 mtime，
  * 是真正碰本地磁盘的地方。
  *
+ * ## 拉取是并发的（2026-10-09 实测改的）
+ *
+ * 旧版在 `onEntry` 里串行「readFile → 写盘」，197 个小文件在 WSL 上要 22 秒 ——
+ * 每个文件一次远程调用，全部排成一队。现在改成两阶段：
+ *
+ *   1. **遍历阶段**（串行，树结构只能按层走）：建目录骨架、判占位、判指纹跳过、
+ *      把「要拉内容的文件」收进队列 —— 这些判断全是本地/已拿到的元数据，零往返。
+ *   2. **拉取阶段**（并发）：按 `transport.readConcurrency` 路同时发 readFile，
+ *      谁回来谁写盘。SSH 是长连接（SFTP 天然支持流水线），收益直接；
+ *      WSL 自带 4 槽位硬限流（见 `#acquire`），这里发再多它也只放行 4 路 ——
+ *      所以镜像层**不需要**自己再限。
+ *
+ * `readFile` 走 `knownSize`（遍历已拿到 size），跳过每个文件一次的 stat 往返。
+ *
  * @param {object} options
  * @param {import('../transport/transport.js').Transport} options.transport
  * @param {string} options.anchorPath 锚点目录（本地绝对路径）
@@ -302,6 +317,10 @@ export async function walkRemoteTree(options) {
  * @param {(progress: { dir: string, written: number }) => void|Promise<void>} [options.onDirectoryDone]
  *   每处理完一个目录回调一次 —— 让调用方**逐目录做检查点**，而不是整轮跑完才存状态。
  * @param {(entry: TreeEntry) => void|Promise<void>} [options.onFileWritten]
+ * @param {(progress: { phase: 'walk'|'fetch', visited?: number, done?: number, total?: number }) => void} [options.onProgress]
+ *   进度上报（供界面的「正在打开」进度条用）：
+ *   - `walk`：遍历阶段，每访问一个条目回调一次 `{ phase:'walk', visited }`（无 total，因为不知道总数）
+ *   - `fetch`：拉取阶段，每写一个文件回调一次 `{ phase:'fetch', done, total }`
  * @param {Record<string, string>} [options.manifest]
  *   上次刷新时每个文件的「内容指纹」—— `size:floor(mtime 秒)`。
  *   与本次一致的文件**不再拉内容**（只保留目录骨架）。这是刷新变快的关键，
@@ -318,6 +337,7 @@ export async function materializeTree(options) {
     signal,
     onDirectoryDone,
     onFileWritten,
+    onProgress,
     manifest = {},
   } = options
 
@@ -340,94 +360,303 @@ export async function materializeTree(options) {
   /** @type {{ path: string, code: string, message: string }[]} */
   const errors = []
 
-  const walk = await walkRemoteTree({
-    transport,
-    remoteRoot,
-    ignore,
-    bounds,
-    signal,
-    onEntry: async (entry) => {
-      const localPath = toAnchorPath(resolvedAnchor, entry.relPath)
-      if (entry.type === 'directory') {
-        await mkdir(localPath, { recursive: true })
-        return
-      }
-      if (entry.type !== 'file') {
-        // 符号链接 / FIFO / socket：不搬内容，也不建占位文件。
-        // 宿主 `@` 补全本来就不索引符号链接目录，建了反而误导。
-        return
-      }
+  /** @type {TreeEntry[]} 要拉内容的文件（在阶段 2 处理） */
+  const toFetch = []
 
-      const fingerprint = fingerprintOf(entry)
-      nextManifest[entry.relPath] = fingerprint
+  /** 遍历阶段已访问的条目数（进度上报用）。 */
+  let walkVisited = 0
 
-      const size = entry.size ?? 0
-      if (size > bounds.maxFileBytes) {
-        oversized.push(entry)
-        // **写占位**，让文件在界面的文件树里看得见。
-        // 以前这里是直接 return —— 那些文件在树里根本不出现，用户以为不存在。
-        try {
-          const exists = await fileExists(localPath)
-          if (!exists || (await localIsPlaceholder(localPath))) {
-            await mkdir(dirname(localPath), { recursive: true })
-            await assertWritable(resolvedAnchor, localPath, entry.relPath)
-            await writeFile(localPath, placeholderContent({
-              relPath: entry.relPath,
-              remoteRoot,
-              size,
-              capBytes: bounds.maxFileBytes,
-            }))
-            // mtime 与远端对齐 —— 否则文件树按时间排序时它会跑到最前面
-            if (entry.mtimeMs !== undefined) {
-              const seconds = entry.mtimeMs / 1000
-              await utimes(localPath, seconds, seconds)
-            }
-            placeholders.push(entry)
-          }
-        } catch (error) {
-          if (isAbort(error, signal)) throw abortError('materializeTree', entry.relPath, error)
-          errors.push({
-            path: entry.relPath,
-            code: error?.code ?? TRANSPORT_ERROR.UNKNOWN,
-            message: String(error?.message ?? error),
-          })
-        }
-        return
-      }
+  /**
+   * 处理一个条目（快路与标准路**共用**）：建目录骨架 / 超限写占位 /
+   * 指纹跳过 / 收集要拉内容的文件。**不碰网络读内容** —— 那是阶段 2 的事。
+   * @param {TreeEntry} entry
+   */
+  const processEntry = async (entry) => {
+    walkVisited += 1
+    onProgress?.({ phase: 'walk', visited: walkVisited })
+    const localPath = toAnchorPath(resolvedAnchor, entry.relPath)
+    if (entry.type === 'directory') {
+      await mkdir(localPath, { recursive: true })
+      skeleton.push(entry)
+      return
+    }
+    if (entry.type !== 'file') {
+      // 符号链接 / FIFO / socket：不搬内容，也不建占位文件。
+      // 宿主 `@` 补全本来就不索引符号链接目录，建了反而误导。
+      return
+    }
 
-      // 指纹没变 → 内容没变，跳过远程读（骨架已经建好）。
-      if (manifest[entry.relPath] === fingerprint && (await fileExists(localPath))) {
-        unchanged.push(entry)
-        return
-      }
+    const fingerprint = fingerprintOf(entry)
+    nextManifest[entry.relPath] = fingerprint
 
+    const size = entry.size ?? 0
+    if (size > bounds.maxFileBytes) {
+      oversized.push(entry)
+      // **写占位**，让文件在界面的文件树里看得见。
       try {
-        await mkdir(dirname(localPath), { recursive: true })
-        const remotePath = joinRemote(remoteRoot, entry.relPath)
-        const content = await transport.readFile(remotePath, {
-          maxBytes: bounds.maxFileBytes,
-          signal,
-        })
-        // 落盘前再判一次围栏：目录刚建出来，此时才能解析出真实路径。
-        await assertWritable(resolvedAnchor, localPath, entry.relPath)
-        await writeFile(localPath, content)
-        if (entry.mtimeMs !== undefined) {
-          const seconds = entry.mtimeMs / 1000
-          await utimes(localPath, seconds, seconds)
+        const exists = await fileExists(localPath)
+        if (!exists || (await localIsPlaceholder(localPath))) {
+          await mkdir(dirname(localPath), { recursive: true })
+          await assertWritable(resolvedAnchor, localPath, entry.relPath)
+          await writeFile(localPath, placeholderContent({
+            relPath: entry.relPath,
+            remoteRoot,
+            size,
+            capBytes: bounds.maxFileBytes,
+          }))
+          // mtime 与远端对齐 —— 否则文件树按时间排序时它会跑到最前面
+          if (entry.mtimeMs !== undefined) {
+            const seconds = entry.mtimeMs / 1000
+            await utimes(localPath, seconds, seconds)
+          }
+          placeholders.push(entry)
         }
-        written.push(entry)
-        if (onFileWritten !== undefined) await onFileWritten(entry)
       } catch (error) {
         if (isAbort(error, signal)) throw abortError('materializeTree', entry.relPath, error)
-        // 单个文件失败不放弃整棵树：记下来，继续。
         errors.push({
           path: entry.relPath,
           code: error?.code ?? TRANSPORT_ERROR.UNKNOWN,
           message: String(error?.message ?? error),
         })
       }
-    },
-  })
+      return
+    }
+
+    // 指纹没变 → 内容没变（骨架已有）→ 跳过远程读。
+    if (manifest[entry.relPath] === fingerprint && (await fileExists(localPath))) {
+      unchanged.push(entry)
+      return
+    }
+
+    // 要拉内容：先建好父目录，收进队列。
+    await mkdir(dirname(localPath), { recursive: true })
+    toFetch.push(entry)
+  }
+
+  // ── 阶段 1：遍历拿元数据（快路 walkTree 或标准 walkRemoteTree）───────────
+  // 快路只有 SSH 有（find -printf 一次拿整棵树结构）；失败静默退回标准路。
+  let walk = null
+  if (typeof transport.walkTree === 'function') {
+    try {
+      const fast = await transport.walkTree(remoteRoot, {
+        maxEntries: bounds.maxEntries,
+        maxDepth: bounds.maxDepth,
+        timeoutMs: bounds.maxDurationMs,
+        signal,
+      })
+      // 快路拿到的是**元数据**（无内容），与标准遍历同构 → 统一走 processEntry。
+      //
+      // ⚠️ 但 find 拿的是**全量未过滤**（含 .gitignore 该忽略的目录及其子孙）——
+      // 标准遍历在「遍历时逐目录剪枝」，快路没有这一步，必须在这里补上：
+      // 按 relPath 排序（父先于子），遇到「被忽略的目录」就把它整棵剪掉（连同子孙）。
+      const pruned = new Set() // 被剪掉的目录前缀
+      const sorted = [...fast.entries].sort((a, b) => a.relPath.localeCompare(b.relPath))
+      const entries = []
+      for (const item of sorted) {
+        // 落在已剪枝目录下 → 跳过（父目录已判忽略）
+        let underPruned = false
+        for (const prefix of pruned) {
+          if (item.relPath === prefix || item.relPath.startsWith(`${prefix}/`)) {
+            underPruned = true
+            break
+          }
+        }
+        if (underPruned) continue
+
+        const isDir = item.type === 'directory'
+        // 目录被忽略 → 整棵剪掉；文件被忽略 → 跳过自己
+        if (ignore.ignores(item.relPath, { isDirectory: isDir })) {
+          if (isDir) pruned.add(item.relPath)
+          continue
+        }
+
+        try {
+          await processEntry(item)
+          entries.push(item)
+        } catch (error) {
+          if (isAbort(error, signal)) throw abortError('materializeTree', item.relPath, error)
+          errors.push({
+            path: item.relPath,
+            code: error?.code ?? TRANSPORT_ERROR.UNKNOWN,
+            message: String(error?.message ?? error),
+          })
+        }
+      }
+      walk = {
+        entries,
+        errors: [],
+        truncated: fast.truncated,
+        reasons: fast.truncated ? [TRUNCATION_REASON.ENTRIES] : [],
+        stats: {
+          visited: entries.length,
+          directories: entries.filter((e) => e.type === 'directory').length,
+          files: entries.filter((e) => e.type === 'file').length,
+          other: entries.filter((e) => e.type === 'other').length,
+          durationMs: fast.durationMs,
+          viaFind: true,
+        },
+      }
+    } catch (error) {
+      if (isAbort(error, signal)) throw abortError('materializeTree', remoteRoot, error)
+      // 探测失败（没 GNU find / 权限不够）→ 退回标准路，**不报错**
+      walk = null
+    }
+  }
+
+  if (walk === null) {
+    walk = await walkRemoteTree({
+      transport,
+      remoteRoot,
+      ignore,
+      bounds,
+      signal,
+      onEntry: processEntry,
+    })
+  }
+
+  // ── 阶段 2：拉取 + 写盘（仅标准路需要；快路在阶段 0 已做完骨架与写盘）───
+  // 优先级：transport 有 readFilesBatch（WSL）→ 批量；否则并发逐个（SSH/Docker）。
+  // 每个任务独立容错：单个文件失败不放弃整棵树（与旧版语义一致）。
+  const writeOne = async (entry, content) => {
+    const localPath = toAnchorPath(resolvedAnchor, entry.relPath)
+    await assertWritable(resolvedAnchor, localPath, entry.relPath)
+    await writeFile(localPath, content)
+    if (entry.mtimeMs !== undefined) {
+      const seconds = entry.mtimeMs / 1000
+      await utimes(localPath, seconds, seconds)
+    }
+    written.push(entry)
+    onProgress?.({ phase: 'fetch', done: written.length, total: toFetch.length })
+    if (onFileWritten !== undefined) await onFileWritten(entry)
+  }
+
+  const noteError = (entry, error) => {
+    errors.push({
+      path: entry.relPath,
+      code: error?.code ?? TRANSPORT_ERROR.UNKNOWN,
+      message: String(error?.message ?? error),
+    })
+  }
+
+  // 进入拉取阶段前报一次「总量」（done=0, total=N），让界面的进度条有分母
+  if (toFetch.length > 0) {
+    onProgress?.({ phase: 'fetch', done: 0, total: toFetch.length })
+  }
+
+  const batchSupported = typeof transport.readFilesBatch === 'function'
+
+  if (batchSupported && toFetch.length > 0) {
+    // ── 快路：批量（WSL）───────────────────────────────────────────────
+    // 每批的路径数：argv 长度安全（一条 wsl.exe 命令行带上所有路径），
+    // 且单批输出 = Σ(base64(文件)) 不至于撑爆 maxBuffer（64 MiB）。
+    const BATCH_SIZE = 40
+    const lanes = Math.max(1, Number(transport.readConcurrency) || 1)
+    let cursor = 0
+    const runBatch = async () => {
+      while (true) {
+        if (signal?.aborted === true) return
+        const start = cursor
+        cursor += BATCH_SIZE
+        const batch = toFetch.slice(start, start + BATCH_SIZE)
+        if (batch.length === 0) return
+
+        let results
+        try {
+          results = await transport.readFilesBatch(
+            batch.map((entry) => joinRemote(remoteRoot, entry.relPath)),
+            { maxBytes: bounds.maxFileBytes, signal },
+          )
+        } catch (error) {
+          if (isAbort(error, signal)) return
+          // 整批失败 → **降级**：这一批退回逐个读（错误分类更细，语义不变）
+          for (const entry of batch) {
+            if (signal?.aborted === true) return
+            try {
+              const content = await transport.readFile(joinRemote(remoteRoot, entry.relPath), {
+                maxBytes: bounds.maxFileBytes,
+                signal,
+                knownSize: entry.size,
+              })
+              await writeOne(entry, content)
+            } catch (one) {
+              if (isAbort(one, signal)) return
+              noteError(entry, one)
+            }
+          }
+          continue
+        }
+
+        for (const entry of batch) {
+          const remotePath = joinRemote(remoteRoot, entry.relPath)
+          const outcome = results.get(remotePath)
+          if (outcome === undefined) {
+            // 脚本没回这个路径（不该发生）：按单文件未知错误记下，不拖垮整棵树
+            noteError(entry, new TransportError(
+              TRANSPORT_ERROR.UNKNOWN,
+              `批量读没有返回 "${entry.relPath}" 的结果`,
+              { operation: 'readFilesBatch', target: remotePath },
+            ))
+            continue
+          }
+          if (outcome.ok !== true) {
+            noteError(entry, outcome.error)
+            continue
+          }
+          try {
+            await writeOne(entry, outcome.data)
+          } catch (error) {
+            if (isAbort(error, signal)) return
+            noteError(entry, error)
+          }
+        }
+      }
+    }
+    const workers = []
+    for (let i = 0; i < Math.min(lanes, Math.ceil(toFetch.length / BATCH_SIZE)); i += 1) {
+      workers.push(runBatch())
+    }
+    await Promise.all(workers)
+  } else if (toFetch.length > 0) {
+    // ── 标准路：并发逐个（SSH / Docker / 批量能力探测失败时）──────────
+    // 并发路数由 transport 自己声明（SSH 8；WSL 还有 #acquire 硬限流兜底）。
+    const lanes = Math.max(1, Number(transport.readConcurrency) || 1)
+    let cursor = 0
+    const fetchOne = async () => {
+      while (true) {
+        if (signal?.aborted === true) return
+        const index = cursor
+        cursor += 1
+        const entry = toFetch[index]
+        if (entry === undefined) return
+        try {
+          const remotePath = joinRemote(remoteRoot, entry.relPath)
+          const content = await transport.readFile(remotePath, {
+            maxBytes: bounds.maxFileBytes,
+            signal,
+            // 遍历已经拿到 size —— 跳过实现里那次多余的 stat 往返（SSH）
+            knownSize: entry.size,
+          })
+          await writeOne(entry, content)
+        } catch (error) {
+          if (isAbort(error, signal)) {
+            // abort 是终态：整批立刻停，不再启动新任务
+            return
+          }
+          noteError(entry, error)
+        }
+      }
+    }
+    const workers = []
+    for (let i = 0; i < Math.min(lanes, toFetch.length); i += 1) workers.push(fetchOne())
+    await Promise.all(workers)
+  }
+
+  // abort 是**终态**：用户点了取消，必须把中断信号一路传到连接层去清理锚点。
+  // worker 里收到 abort 是「不再启动新任务」地退出，这里统一把它变成一次抛错 ——
+  // 否则 mirror.init 会拿到一个「部分完成」的结果，connect 照常继续 → 取消形同虚设。
+  if (signal?.aborted === true) {
+    throw abortError('materializeTree', remoteRoot, new TransportError(TRANSPORT_ERROR.ABORTED, '已取消', { operation: 'materializeTree', target: remoteRoot }))
+  }
 
   return {
     entries: walk.entries,
@@ -559,7 +788,7 @@ export const DEFAULT_DEEPEN_BOUNDS = {
 /**
  * **后台补拉**：把「文本类 + 在上限内」的文件内容补进镜像。
  *
- * 为什么要这一步（2026-10-07 用户反馈）：
+ * 为什么要这一步（2026-10-07 实测发现）：
  * 首轮遍历为了「连接要快」只拉 256 KiB 以内的文件 ——
  * 结果 300 KB 的 README、500 KB 的日志在界面的文件树里点开只有一句占位说明。
  * 而界面的读文件路径是**宿主独占**的（我们插不进手，实测 `provide` 会被拒），

@@ -38,3 +38,6 @@ Thumbs.db
 # 本地开发残留
 .dsh/
 *.local
+
+# npm pack 产物（发布时才生成，绝不入库）
+*.tgz

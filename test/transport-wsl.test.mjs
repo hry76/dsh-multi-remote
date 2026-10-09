@@ -128,6 +128,29 @@ if (after[0] === 'sh' && after[1] === '-c') {
     process.exit(0)
   }
 
+  // 批量读：脚本第 1 个参数是 maxBytes，后面全是路径。
+  // 输出协议：每文件「路径 NUL 长度 NUL base64 NUL」；缺失文件长度 = -1、无内容段。
+  // 判据：批量脚本是唯一「for p in "$@"」的（其余脚本都是单路径 $1）。
+  // ⚠️ 必须放在「head -c」分支**之前** —— 批量脚本里也有 head -c（取 max+1），
+  // 晚判就会被单文件分支抢走，把 maxBytes 当成文件路径。
+  if (script.includes('for p in "$@"')) {
+    const max = Number(scriptArgs[0])
+    const paths = scriptArgs.slice(1)
+    let out = ''
+    for (const path of paths) {
+      const content = files[path]
+      if (content === undefined) {
+        out += path + '\\0-1\\0'
+        continue
+      }
+      const buf = Buffer.from(content, 'utf8')
+      const b64 = buf.subarray(0, max + 1).toString('base64')
+      out += path + '\\0' + String(b64.length) + '\\0' + b64 + '\\0'
+    }
+    process.stdout.write(out)
+    process.exit(0)
+  }
+
   if (script.includes('head -c')) {
     const content = files[p]
     if (content === undefined) process.exit(2)
@@ -598,4 +621,60 @@ test('构造：缺少 distro 直接抛错', () => {
   assert.throws(() => new WslTransport({}), /distro/)
   assert.throws(() => new WslTransport({ distro: '   ' }), /distro/)
   // 负对照：允许空 distro → 每个操作都失败在深处，错误信息指不到根因
+})
+
+// ── readFilesBatch（2026-10-09 新增：镜像首次拉取 10× 提速的手段）──────────
+
+test('readFilesBatch：一批路径一次调用拿全，缺失文件给 NOT_FOUND', async () => {
+  await withFake({
+    files: {
+      '/home/u/a.txt': 'hello\n',
+      '/home/u/b.txt': 'world\n',
+      '/home/u/big.txt': 'x'.repeat(100),
+    },
+  }, async (fake) => {
+    const transport = new WslTransport({ distro: 'Ubuntu-24.04', wslExe: ['node', fake.fakePath] })
+    await transport.connect()
+    const out = await transport.readFilesBatch(
+      ['/home/u/a.txt', '/home/u/missing.txt', '/home/u/b.txt'],
+      { maxBytes: 1024 },
+    )
+
+    assert.equal(out.size, 3, '每个路径都要有结果')
+    assert.deepEqual(out.get('/home/u/a.txt').data.toString('utf8'), 'hello\n')
+    assert.deepEqual(out.get('/home/u/b.txt').data.toString('utf8'), 'world\n')
+    const miss = out.get('/home/u/missing.txt')
+    assert.equal(miss.ok, false, '缺失文件必须是失败结果')
+    assert.equal(miss.error.code, TRANSPORT_ERROR.NOT_FOUND, '缺失文件分类成 NOT_FOUND')
+
+    // **一次**调用拿全 —— 这就是提速的全部来源（不是并发，是省掉 spawn）
+    const calls = (await readCalls(fake.logPath))
+      .filter((c) => c.argv.includes('-c') && JSON.stringify(c.argv).includes('for p in'))
+    assert.equal(calls.length, 1, '一批三个文件必须只 spawn 一次')
+    // 负对照：退回逐个读 → 3 个文件 3 次 spawn，197 个文件就是 197 次（实测 22 秒）
+  })
+})
+
+test('readFilesBatch：超限文件给 TOO_LARGE（失败，不截断）', async () => {
+  await withFake({ files: { '/home/u/big.txt': 'x'.repeat(100) } }, async (fake) => {
+    const transport = new WslTransport({ distro: 'Ubuntu-24.04', wslExe: ['node', fake.fakePath] })
+    await transport.connect()
+    const out = await transport.readFilesBatch(['/home/u/big.txt'], { maxBytes: 10 })
+    const r = out.get('/home/u/big.txt')
+    assert.equal(r.ok, false)
+    assert.equal(r.error.code, TRANSPORT_ERROR.TOO_LARGE)
+    // 负对照：静默截断 → 上层以为拉到了完整内容，写进镜像的是残文件
+  })
+})
+
+test('readFilesBatch：空列表直接返回，不发起调用', async () => {
+  await withFake({}, async (fake) => {
+    const transport = new WslTransport({ distro: 'Ubuntu-24.04', wslExe: ['node', fake.fakePath] })
+    await transport.connect()
+    const before = (await readCalls(fake.logPath)).length
+    const out = await transport.readFilesBatch([])
+    assert.equal(out.size, 0)
+    const after = (await readCalls(fake.logPath)).length
+    assert.equal(after - before, 0, '空批不该 spawn（connect 的调用不算）')
+  })
 })

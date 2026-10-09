@@ -1,7 +1,7 @@
 /**
  * 会话绑定 —— 抓住「会话刚创建、第一轮还没开始」那个窗口，把远程预设挂上去。
  *
- * ## 为什么必须挂在这个窗口上（D-018 的时机约束）
+ * ## 为什么必须挂在这个窗口上（时机约束）
  *
  * 预设**只能在会话开始第一轮之前选定**：之后 `agentPresets.select()` 抛
  * `agent-preset/locked`（实测）。所以用户流程被钉死成：
@@ -21,7 +21,7 @@
  * 第二条尤其关键：参考项目就是只 await 在途状态，切换失败后第一步仍然在本机执行。
  * 这里改成**检查最终状态**：切换没成功就拒绝这一步。
  */
-import { presetIdFor } from './preset.js'
+import { PRESET_ID } from './preset.js'
 
 /** 绑定失败的分类。 */
 export const BIND_STATUS = {
@@ -198,5 +198,5 @@ export function cwdIsAnchor(cwd, anchors) {
   return anchors.some((anchor) => normalize(anchor) === target)
 }
 
-/** 预设 id 的便捷再导出（绑定逻辑与连接逻辑必须用同一个派生函数）。 */
-export { presetIdFor }
+/** 预设 id 的便捷再导出（绑定逻辑与连接逻辑必须用同一个常量）。 */
+export { PRESET_ID }

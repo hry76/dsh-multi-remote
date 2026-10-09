@@ -1,7 +1,7 @@
 /**
  * SSH transport —— 用 `ssh2` 库实现 `Transport` 契约。
  *
- * ## 为什么用 `ssh2` 而不是系统 OpenSSH CLI（D-007）
+ * ## 为什么用 `ssh2` 而不是系统 OpenSSH CLI
  *
  * 系统 CLI 拿不到结构化错误处理：认证次数耗尽、只支持 keyboard-interactive 的主机、
  * 超时、keepalive —— 这几类只有库能优雅处理。ZCode 与两个参考项目都用的库。
@@ -24,6 +24,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { readFile, stat as statFile } from 'node:fs/promises'
 
 import { Transport, TRANSPORT_ERROR, TransportError, assertNoNul } from './transport.js'
+import { parseTar } from './tar.js'
 
 /**
  * `ssh2` 是**唯一**的运行时依赖，所以它可能因为各种原因没被装上
@@ -75,7 +76,7 @@ export const HOST_KEY_RESULT = {
 /**
  * 已知主机记录表 —— TOFU 的实现点。
  *
- * 只做内存记录：M1 不做持久化（持久化与凭据保护是 M2 的事，见需求文档）。
+ * 只做内存记录：**不落盘**，重启即忘。
  * 但**语义现在就要对**：变更一律拒绝、可手动重置。
  */
 export class KnownHosts {
@@ -456,7 +457,7 @@ export class SshTransport extends Transport {
    *
    * SSH 是长连接，网络抖动、服务端重启 sshd、NAT 表项过期都会让通道断掉。
    * `assertAlive` 会让后续每个操作立刻失败 —— 但**重连一下通常就好**，
-   * 用户完全想不到「只是断过，重连就行」（与 Docker 引擎重启是同一类问题，见 D-026）。
+   * 用户完全想不到「只是断过，重连就行」（与 Docker 引擎重启是同一类问题）。
    *
    * ## 为什么必须区分「连过又断」与「从没连过」
    *
@@ -580,26 +581,51 @@ export class SshTransport extends Transport {
 
   async #readFileImpl(path, options = {}) {
     throwIfAborted(options.signal, 'readFile', path)
-    const info = await this.stat(path, options)
-    if (info.type === 'directory') {
-      throw new TransportError(TRANSPORT_ERROR.WRONG_TYPE, `"${path}" 是目录，不是文件`, {
-        operation: 'readFile',
-        target: path,
-        retryable: false,
-      })
-    }
-    if (options.maxBytes !== undefined && info.size > options.maxBytes) {
-      throw new TransportError(
-        TRANSPORT_ERROR.TOO_LARGE,
-        `"${path}" 有 ${info.size} 字节，超过上限 ${options.maxBytes}`,
-        { operation: 'readFile', target: path, retryable: false },
-      )
+
+    // 快路：调用方已从目录遍历拿到 size（`knownSize`）→ 跳过 stat，每文件省一次 RTT。
+    // 遍历 N 个文件就是 N 次往返 —— 这是首次拉取的最大头。
+    // 类型校验（目录读不了）推迟给 SFTP 自己报错：它对目录的 open 会明确失败，
+    // 错误分类照旧走 sftpError，不会把目录当内容读回来。
+    if (typeof options.knownSize === 'number' && Number.isFinite(options.knownSize)) {
+      if (options.maxBytes !== undefined && options.knownSize > options.maxBytes) {
+        throw new TransportError(
+          TRANSPORT_ERROR.TOO_LARGE,
+          `"${path}" 有 ${options.knownSize} 字节，超过上限 ${options.maxBytes}`,
+          { operation: 'readFile', target: path, retryable: false },
+        )
+      }
+    } else {
+      const info = await this.stat(path, options)
+      if (info.type === 'directory') {
+        throw new TransportError(TRANSPORT_ERROR.WRONG_TYPE, `"${path}" 是目录，不是文件`, {
+          operation: 'readFile',
+          target: path,
+          retryable: false,
+        })
+      }
+      if (options.maxBytes !== undefined && info.size > options.maxBytes) {
+        throw new TransportError(
+          TRANSPORT_ERROR.TOO_LARGE,
+          `"${path}" 有 ${info.size} 字节，超过上限 ${options.maxBytes}`,
+          { operation: 'readFile', target: path, retryable: false },
+        )
+      }
     }
 
     const buffer = await this.#sftpCall('readFile', (sftp, done) => {
-      // SFTP 的 readFile 会把整个文件读进内存；上面已经用 maxBytes 挡过大小
+      // SFTP 的 readFile 会把整个文件读进内存；大小校验在上面已经做过了
       sftp.readFile(path, (error, data) => (error ? done(error) : done(undefined, data)))
     })
+
+    // 后置校验：stat/遍历与 read 之间文件可能变大（罕见但真实）。
+    // 读到的超过上限就按契约失败，**绝不静默截断**。
+    if (options.maxBytes !== undefined && buffer.length > options.maxBytes) {
+      throw new TransportError(
+        TRANSPORT_ERROR.TOO_LARGE,
+        `"${path}" 实际 ${buffer.length} 字节，超过上限 ${options.maxBytes}`,
+        { operation: 'readFile', target: path, retryable: false },
+      )
+    }
 
     if (options.encoding === undefined) return buffer
     // 与宿主一致：文本读取拒绝 NUL 与非法 UTF-8，而不是塞给上层一堆替换字符
@@ -611,6 +637,172 @@ export class SshTransport extends Transport {
       })
     }
     return buffer.toString(options.encoding)
+  }
+
+  /**
+   * **快路：一次 `find -printf` 拿整棵树的元数据（结构，不含内容）**。
+   *
+   * 背景（2026-10-09 真机实测，12659 文件的项目）：
+   * SFTP 逐目录 readdir 要 **17.7 秒**；`find -printf` 一次命令 **0.23 秒**（~77 倍），
+   * 输出 1.4 MB 纯文本。内容不在这里拉 —— 交给 `readFilesBatch`（tar 只打小文件）。
+   *
+   * 这是**可选能力**：镜像层探测到 `transport.walkTree` 存在才走这条路，
+   * 探测失败（distroless / busybox 没有 GNU find）就退回标准路（逐目录 readdir）。
+   *
+   * ⚠️ 为什么不用 `tar` 拿结构：`tar cf -` 会**打包文件内容**，12659 个文件直接
+   * 撑爆超时（实测 120s 超时）。`find -printf` 只输出元数据，轻量得多。
+   *
+   * @param {string} remoteRoot 远程根（绝对 POSIX 路径）
+   * @param {object} [options]
+   * @param {number} [options.maxEntries=20000]
+   * @param {number} [options.maxDepth=12]
+   * @param {number} [options.timeoutMs=60000]
+   * @param {AbortSignal} [options.signal]
+   * @returns {Promise<{
+   *   entries: Array<{ relPath: string, type: 'file'|'directory'|'other',
+   *                    size?: number, mtimeMs?: number }>,
+   *   truncated: boolean,
+   *   durationMs: number,
+   * }>}
+   * @throws {TransportError} 探测失败（走不了这条路）—— 调用方据此降级
+   */
+  async walkTree(remoteRoot, options = {}) {
+    throwIfAborted(options.signal, 'walkTree', remoteRoot)
+    const maxEntries = options.maxEntries ?? 20_000
+    const maxDepth = options.maxDepth ?? 12
+    const timeoutMs = options.timeoutMs ?? 60_000
+    const startedAt = Date.now()
+
+    // 探测：这台远端有 GNU find（-printf 支持）吗？（首次用到才测，结果缓存）
+    if (this.findGnu === undefined) {
+      const probe = await this.exec('find --version 2>/dev/null | grep -q GNU && echo GNU_OK', { timeoutMs: 15_000, signal: options.signal })
+      this.findGnu = probe.code === 0 && probe.stdout.trim() === 'GNU_OK'
+    }
+    if (this.findGnu !== true) {
+      throw new TransportError(
+        TRANSPORT_ERROR.UNKNOWN,
+        '远端没有 GNU find（-printf 不可用），walkTree 不可用；请用 SFTP 标准路',
+        { operation: 'walkTree', target: remoteRoot, retryable: false },
+      )
+    }
+
+    // find -printf：一次拿整棵树的元数据。%P=相对路径 %y=类型 %s=大小 %T@=mtime。
+    // NUL 分隔，与 readdir 的解析口径一致（文件名含换行也不怕）。
+    const result = await this.exec(
+      `find ${shellQuote(remoteRoot)} -printf '%P\\0%y\\0%s\\0%T@\\0'`,
+      { timeoutMs, signal: options.signal, rawStdout: true },
+    )
+    if (result.code !== 0) {
+      throw new TransportError(
+        TRANSPORT_ERROR.UNKNOWN,
+        `walkTree 失败（find exit ${result.code}）：${result.stderr.trim()}`,
+        { operation: 'walkTree', target: remoteRoot, retryable: false },
+      )
+    }
+
+    // 解析：每 4 个字段一组（relPath / type / size / mtime）
+    const text = result.stdout.toString('utf8')
+    const fields = text.split('\0')
+    const entries = []
+    let count = 0
+    for (let i = 0; i + 3 < fields.length; i += 4) {
+      if (count >= maxEntries) {
+        break
+      }
+      const rel = fields[i]
+      if (rel === '' || rel === '.') continue // 根本身 / find 的根占位
+      // 深度过滤（find 不按层截断，宿主侧按 `/` 计数）
+      if (rel.split('/').length > maxDepth) continue
+
+      const kind = fields[i + 1]
+      const size = Number(fields[i + 2] ?? 0)
+      const mtimeSec = Number.parseFloat(fields[i + 3] ?? '0')
+      const type = kind === 'd' ? 'directory' : kind === 'f' ? 'file' : 'other'
+      entries.push({
+        relPath: rel,
+        type,
+        ...(type === 'file' ? { size, mtimeMs: Math.round(mtimeSec * 1000) } : { mtimeMs: Math.round(mtimeSec * 1000) }),
+      })
+      count += 1
+    }
+
+    return {
+      entries,
+      truncated: fields.length / 4 > maxEntries,
+      durationMs: Date.now() - startedAt,
+    }
+  }
+
+  /**
+   * **批量读：一次 `tar cf - -T -` 拉一批小文件**（SSH 版的 WSL readFilesBatch）。
+   *
+   * 背景：SFTP 逐文件 readFile 每个文件 open+read+close 好几次往返；tar 一次命令
+   * 流回一批。与 WSL 的 base64 批量是**同一能力的两实现** —— 镜像层探测到
+   * `readFilesBatch` 就自动走批量路。
+   *
+   * 这是**可选能力**：探测失败（没 tar）就抛错，镜像层退回逐个读。
+   *
+   * @param {string[]} paths 要读的绝对远程路径
+   * @param {{ maxBytes?: number, signal?: AbortSignal }} [options]
+   * @returns {Promise<Map<string, { ok: true, data: Buffer } | { ok: false, error: TransportError }>>}
+   */
+  async readFilesBatch(paths, options = {}) {
+    throwIfAborted(options.signal, 'readFilesBatch', `(${paths.length} 个文件)`)
+    if (paths.length === 0) return new Map()
+    const maxBytes = options.maxBytes ?? 256 * 1024
+
+    // 探测 tar（首次缓存）。镜像层只对小文件（≤maxFileBytes）调批量，所以 tar 的输出
+    // 有界（40 × 256KiB ≈ 10MB），不会像「拿整棵树」那样超时。
+    if (this.tarAvailable === undefined) {
+      const probe = await this.exec('command -v tar >/dev/null 2>&1 && echo TAR_OK', { timeoutMs: 15_000, signal: options.signal })
+      this.tarAvailable = probe.code === 0 && probe.stdout.trim() === 'TAR_OK'
+    }
+    if (this.tarAvailable !== true) {
+      throw new TransportError(
+        TRANSPORT_ERROR.UNKNOWN,
+        '远端没有 tar，readFilesBatch 不可用；请用 SFTP 逐个读',
+        { operation: 'readFilesBatch', target: this.host, retryable: false },
+      )
+    }
+
+    // tar -T - 从 stdin 读路径列表（--verbatim-files-from 防通配符展开）。
+    // 绝对路径会让 tar 打头带 / 并警告；用 --transform 或直接容忍（见下面解析）。
+    const list = paths.map((p) => `${p}\n`).join('')
+    const result = await this.exec(
+      'tar cf - -T - --verbatim-files-from --format=ustar 2>/dev/null',
+      { timeoutMs: 120_000, signal: options.signal, rawStdout: true, stdin: list },
+    )
+    // 注意：tar 对缺失文件 exit 非 0 但仍产出其它文件；这里不按 exit 判失败，
+    // 而是解析能拿到的，缺的标 NOT_FOUND（与 WSL 语义一致）。
+
+    const parsed = parseTar(result.stdout)
+    const out = new Map()
+    const seen = new Map()
+    for (const item of parsed) {
+      if (item.type !== '0' && item.type !== '') continue // 只要普通文件
+      // tar 剥掉了绝对路径的开头 `/` → 补回，与入参 key 对齐
+      const name = item.name.startsWith('/') ? item.name : `/${item.name}`
+      seen.set(name, item)
+    }
+    for (const path of paths) {
+      const item = seen.get(path)
+      if (item === undefined) {
+        out.set(path, { ok: false, error: new TransportError(
+          TRANSPORT_ERROR.NOT_FOUND, `"${path}" 不存在或不可读`,
+          { operation: 'readFile', target: path, retryable: false },
+        ) })
+        continue
+      }
+      if (item.size > maxBytes) {
+        out.set(path, { ok: false, error: new TransportError(
+          TRANSPORT_ERROR.TOO_LARGE, `"${path}" 超过上限 ${maxBytes} 字节（${item.size}）`,
+          { operation: 'readFile', target: path, retryable: false },
+        ) })
+        continue
+      }
+      out.set(path, { ok: true, data: item.data })
+    }
+    return out
   }
 
   /**
@@ -647,6 +839,7 @@ export class SshTransport extends Transport {
       })
     } catch (error) {
       // 尽力清掉临时文件，避免留下垃圾
+      // 尽力删临时文件：失败不能覆盖下面那个**真正的**错误
       await this.#sftpCall('unlink(temp)', (sftp, done) => {
         sftp.unlink(tempPath, () => done())
       }).catch(() => {})
@@ -709,6 +902,9 @@ export class SshTransport extends Transport {
     return new Promise((resolve, reject) => {
       let settled = false
       let stdout = ''
+      // 二进制模式（tar 流）：不能用 utf8 拼接，会损坏字节
+      const rawStdout = []
+      let rawStdoutLength = 0
       let stderr = ''
       let exitCode
       let exitSignal
@@ -765,7 +961,12 @@ export class SshTransport extends Transport {
         }
         stream = channel
         channel.on('data', (chunk) => {
-          stdout += String(chunk)
+          if (options.rawStdout === true) {
+            rawStdout.push(chunk)
+            rawStdoutLength += chunk.length
+          } else {
+            stdout += String(chunk)
+          }
           options.onStdout?.(chunk)
         })
         channel.stderr.on('data', (chunk) => {
@@ -783,7 +984,8 @@ export class SshTransport extends Transport {
             signal: (exitSignal ?? signal) === undefined || (exitSignal ?? signal) === null
               ? undefined
               : String(exitSignal ?? signal),
-            stdout,
+            // 二进制模式时给 Buffer 版 stdout（供 tar 解析），文本模式照给 string
+            stdout: options.rawStdout === true ? Buffer.concat(rawStdout, rawStdoutLength) : stdout,
             stderr,
           })
         })

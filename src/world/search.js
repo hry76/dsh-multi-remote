@@ -33,12 +33,12 @@
  *
  * ## 只做「远程」这一件事
  *
- * 路径翻译复用 `world/translate.js`（与 `world/fs`、`world/shell` 同一套规则），
- * 所以模型用锚点形态的路径也能搜。
+ * 路径翻译 + 路由复用 `session/workspace-routes.js`（与 `world/fs`、`world/shell`
+ * 同一套规则），所以模型用锚点形态的路径也能搜，且会路由到正确的项目。
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
-import { resolveRemotePath } from './translate.js'
+import { translateToRemote } from '../session/workspace-routes.js'
 import { shellQuote } from '../terminal/quote.js'
 
 export const name = '@jk-uzi/dsh-multi-remote/world-search'
@@ -310,26 +310,26 @@ export function renderGrepText(matches, root, truncated, partial = false) {
  * @param {{ profileId: string, remoteRoot: string, localAnchorPath?: string, maxResults?: number, timeoutMs?: number }} config
  */
 export function apply(ctx, config = {}) {
-  const profileId = config.profileId
-  const remoteRoot = config.remoteRoot
-  if (typeof profileId !== 'string' || profileId === '') {
-    throw new Error('world-search: config.profileId 必填（拿不到就拒绝挂载，绝不回退到本机）')
-  }
-  if (typeof remoteRoot !== 'string' || !remoteRoot.startsWith('/')) {
-    throw new Error('world-search: config.remoteRoot 必须是以 / 开头的绝对 POSIX 路径')
-  }
-  const localAnchorPath = typeof config.localAnchorPath === 'string' ? config.localAnchorPath : undefined
+  // 方案 A：search 不再绑固定连接 —— 按搜索路径（或会话 cwd）路由。
   const cap = config.maxResults ?? DEFAULT_MAX_RESULTS
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS
 
   const log = ctx.logger
   const shell = ctx.shell
 
-  const toRemote = (path) => resolveRemotePath(path ?? '.', { remoteRoot, localAnchorPath, cwd: remoteRoot, log })
+  /**
+   * 把「搜索目录参数 + 会话 cwd」翻译成远程绝对路径并路由。
+   * @param {string|undefined} path 搜索目录参数（可空，空则用会话工作区）
+   * @param {string|undefined} cwd 会话 cwd（本机锚点目录）
+   */
+  const toRemote = (path, cwd) => {
+    const raw = typeof path === 'string' && path.trim() !== '' ? path : (cwd ?? '.')
+    return translateToRemote(raw, { cwd })
+  }
 
   /** 跑一条远程命令并拿 stdout（失败要说得清，绝不返回空结果冒充成功）。 */
-  const runRemote = async (command, signal) => {
-    const spec = shell.resolve({ command, workdir: remoteRoot, timeoutMs, stdoutMaxBytes: DEFAULT_MAX_OUTPUT_BYTES, signal })
+  const runRemote = async (command, workdir, signal) => {
+    const spec = shell.resolve({ command, workdir, timeoutMs, stdoutMaxBytes: DEFAULT_MAX_OUTPUT_BYTES, signal })
     const process = await shell.execute(spec)
     const result = await process.result()
 
@@ -338,7 +338,7 @@ export function apply(ctx, config = {}) {
 
     // ⚠️ **超时不是错误** —— 改成「返回已找到的部分 + 如实标注不完整」（2026-10-07 实测改进）。
     //
-    // 之前这里直接抛「搜索超时」，用户连的是整个家目录（`/home/user`），
+    // 之前这里直接抛「搜索超时」，用户连的是整个家目录（`~`），
     // 30 秒搜不完，于是**一条结果都拿不到**，只有一句报错。
     // 但 find/grep 是**边跑边输出**的：已经找到的部分完全有用。
     // 现在把部分结果返回去，并标明「可能不完整」，让模型能自己决定要不要缩窄。
@@ -391,8 +391,9 @@ export function apply(ctx, config = {}) {
     },
     async execute(args, exec) {
       const { source } = globToEre(args.pattern)
-      const root = toRemote(args.path)
-      const run = await runRemote(buildGlobCommand({ root, ere: source, cap }), exec?.signal)
+      const cwd = exec?.agent?.session?.header?.cwd
+      const { remotePath: root } = toRemote(args.path, cwd)
+      const run = await runRemote(buildGlobCommand({ root, ere: source, cap }), root, exec?.signal)
       const { paths, truncated } = parseGlobOutput(run.stdout, cap)
       return { root, paths, truncated: truncated || run.truncated, partial: run.partial }
     },
@@ -440,9 +441,11 @@ export function apply(ctx, config = {}) {
       }],
     },
     async execute(args, exec) {
-      const root = toRemote(args.path)
+      const cwd = exec?.agent?.session?.header?.cwd
+      const { remotePath: root } = toRemote(args.path, cwd)
       const run = await runRemote(
         buildGrepCommand({ root, pattern: String(args.pattern ?? ''), include: args.include, cap }),
+        root,
         exec?.signal,
       )
       const { matches, truncated } = parseGrepOutput(run.stdout, cap)

@@ -40,7 +40,7 @@ export class FenceError extends Error {
  * 归一化会吃掉 `.` 与 `..` 段；任何试图逃出远程根的输入都会被围栏拒绝。
  *
  * @param {string} remotePath 远程侧路径（绝对或相对 remoteRoot）
- * @param {string} remoteRoot 远程根，例如 `/home/user/project`
+ * @param {string} remoteRoot 远程根，例如 `/data/project`
  * @returns {string} 形如 `src/app.js` 的相对路径；远程根本身返回 `''`
  * @throws {FenceError} 路径逃出 remoteRoot 时
  */
@@ -208,7 +208,7 @@ export function assertInsideAnchor(resolvedAnchorPath, resolvedTargetPath, conte
 function normalizeForCompare(input) {
   if (input === '') return ''
   if (isWindowsPath(input)) {
-    // Windows 路径大小写不敏感：`D:\Anchor` 与 `d:\anchor\x` 必须被判为同源，
+    // Windows 路径大小写不敏感：`<盘符>:\Anchor` 与 `<盘符>:\anchor\x` 必须被判为同源，
     // 否则 `win32.relative()` 会算出 `..\..` 这种假逃逸（或反过来漏判）。
     const trimmed = win32.normalize(input).toLowerCase()
     return trimmed.length > 3 && trimmed.endsWith('\\') ? trimmed.slice(0, -1) : trimmed

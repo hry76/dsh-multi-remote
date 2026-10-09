@@ -11,7 +11,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { SessionBinder, BIND_STATUS, cwdIsAnchor } from '../src/session/binder.js'
-import { PresetRegistry, presetIdFor } from '../src/session/preset.js'
+import { PresetRegistry, PRESET_ID } from '../src/session/preset.js'
 
 /** 假的 agent。 */
 function fakeAgent(id, cwd) {
@@ -121,7 +121,7 @@ test('本地会话完全不受影响：不绑定、不 select、放行', async (
 
 test('远程会话：绑定成功，且 select 用的正是派生出来的预设 id', async () => {
   const anchor = '/anchors/mr-conn-1-abc'
-  const presetId = presetIdFor('conn-1', '/home/user/proj')
+  const presetId = PRESET_ID
   const agentPresets = fakeAgentPresets({ registered: [presetId] })
   const registry = new PresetRegistry({ agentPresets })
   const connections = fakeConnections(anchor, presetId)
@@ -142,7 +142,7 @@ test('远程会话：绑定成功，且 select 用的正是派生出来的预设
 
 test('远程会话：预设不可用时拒绝这一步（绝不静默降级到本机）', async () => {
   const anchor = '/anchors/mr-conn-1-abc'
-  const presetId = presetIdFor('conn-1', '/home/user/proj')
+  const presetId = PRESET_ID
   const agentPresets = fakeAgentPresets({ registered: [presetId], brokenIds: [presetId] })
   const registry = new PresetRegistry({ agentPresets })
   const connections = fakeConnections(anchor, presetId)
@@ -167,7 +167,7 @@ test('远程会话：预设不可用时拒绝这一步（绝不静默降级到�
 
 test('远程会话：select 抛 agent-preset/locked 时也算失败并拒绝', async () => {
   const anchor = '/anchors/mr-conn-1-abc'
-  const presetId = presetIdFor('conn-1', '/home/user/proj')
+  const presetId = PRESET_ID
   const locked = Object.assign(new Error('This session has already started'), { code: 'agent-preset/locked' })
   const agentPresets = fakeAgentPresets({ registered: [presetId], selectThrows: locked })
   const registry = new PresetRegistry({ agentPresets })
@@ -190,7 +190,7 @@ test('远程会话：select 抛 agent-preset/locked 时也算失败并拒绝', a
 
 test('远程会话：切换后生效的预设不是我们要的，也判为失败', async () => {
   const anchor = '/anchors/mr-conn-1-abc'
-  const presetId = presetIdFor('conn-1', '/home/user/proj')
+  const presetId = PRESET_ID
   const agentPresets = fakeAgentPresets({ registered: [presetId], composedPreset: 'standard' })
   const registry = new PresetRegistry({ agentPresets })
   const connections = fakeConnections(anchor, presetId)
@@ -210,7 +210,7 @@ test('远程会话：切换后生效的预设不是我们要的，也判为失�
 
 test('远程会话：重复绑定是幂等的（不重复 select）', async () => {
   const anchor = '/anchors/mr-conn-1-abc'
-  const presetId = presetIdFor('conn-1', '/home/user/proj')
+  const presetId = PRESET_ID
   const agentPresets = fakeAgentPresets({ registered: [presetId] })
   const registry = new PresetRegistry({ agentPresets })
   const connections = fakeConnections(anchor, presetId)

@@ -393,6 +393,33 @@ export async function ensureBundleRegistered(profileDir, packageName) {
 }
 
 /** 主流程。 */
+/**
+ * 安装命令失败时该打印什么。
+ *
+ * ⚠️ **必须分清「命令根本没跑起来」和「命令跑了但失败」。**
+ * 实测踩到：`dsh` 不在 PATH 里时（DSH Desktop 的 CLI 在安装目录下，
+ * 通常没进 PATH），spawn 直接 `ENOENT` —— 而原先这里**只会**列 pnpm 的两条原因，
+ * 用户照着去改 `pnpm-workspace.yaml`、删 `node_modules`，**怎么改都不对**，
+ * 最后只会以为「这插件装不上」。
+ *
+ * @param {{code?: number, error?: {code?: string}}} result spawn 的结算结果
+ * @param {{bin: string, profile: string, workspaceFile: string}} options
+ * @returns {string} 写到 stderr 的提示（结尾带换行）
+ */
+export function installFailureHint(result, options) {
+  if (result?.error?.code === 'ENOENT') {
+    return `\n✗ 找不到 \`${options.bin}\` —— 命令根本没跑起来，**跟 pnpm 无关**。\n` +
+      `  用 \`--bin <路径>\` 指定它，或者把它加进 PATH。\n` +
+      `  DSH Desktop 的 CLI 在：<安装目录>/resources/runtime/cli/bin/dsh\n` +
+      `  例：node scripts/install.mjs --profile ${options.profile} --bin "<安装目录>/resources/runtime/cli/bin/dsh"\n`
+  }
+  return `\n✗ 安装命令以非零退出码结束（${result?.code}）。\n` +
+    `  常见原因与对策：\n` +
+    `    ERR_PNPM_IGNORED_BUILDS → 表态没写进去；确认 ${options.workspaceFile} 里有 allowBuilds\n` +
+    `    ERR_PNPM_EPERM          → 上一次的 link 残留（Windows junction）挡住了；\n` +
+    `                              删掉 <profile>/node_modules 后重试\n`
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2))
   if (options.help === true) {
@@ -464,13 +491,11 @@ async function main() {
   if (installed.stderr.trim() !== '') process.stderr.write(installed.stderr)
 
   if (installed.code !== 0) {
-    process.stderr.write(
-      `\n✗ 安装命令以非零退出码结束（${installed.code}）。\n` +
-      `  常见原因与对策：\n` +
-      `    ERR_PNPM_IGNORED_BUILDS → 表态没写进去；确认 ${workspaceFile} 里有 allowBuilds\n` +
-      `    ERR_PNPM_EPERM          → 上一次的 link 残留（Windows junction）挡住了；\n` +
-      `                              删掉 <profile>/node_modules 后重试\n`,
-    )
+    process.stderr.write(installFailureHint(installed, {
+      bin: options.bin,
+      profile: options.profile,
+      workspaceFile,
+    }))
     return 1
   }
 
@@ -510,7 +535,7 @@ async function main() {
       (added.length > 0 ? `  本次新增：${added.join(', ')}\n` : '') +
       `\n下一步：重启该 profile 让插件生效，然后自检：\n` +
       `  dsh --profile ${options.profile} --no-open\n` +
-      `  # GET http://127.0.0.1:<port>/multi-remote/selfcheck\n`,
+      `  # GET http://<回环>:<port>/multi-remote/selfcheck\n`,
     )
     return 0
   }

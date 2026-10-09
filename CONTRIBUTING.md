@@ -554,78 +554,6 @@ await new Promise((r) => server.listen(0, '127.0.0.1', r))   // 端口 0 = 系�
 > 它的存在让未知密钥走 TOFU（自动记住）；**不给它**、又没预置 `known_hosts` 时
 > 会**拒绝连接** —— 那是刻意的「宁可拒绝也不静默接受陌生密钥」。
 
-### 4.26 WSL 发行版不一定是 GNU：busybox 的三条坑（实测）
-
-Docker Desktop 的 `docker-desktop` 发行版是 **busybox**（BusyBox v1.37），
-Alpine-on-WSL 也是。拿它当目标时实测踩到三条：
-
-| 坑 | 现象 | 解法 |
-|---|---|---|
-| **没有 `bash`** | `execvpe(bash) failed: No such file or directory` | 连接时探测一次：优先 `bash -lc`，没有就 `sh -c` —— **POSIX shell 才是硬要求** |
-| **`find` 没有 `-printf`** | `find: unrecognized: -printf` | 退到 `find -exec sh -c '…stat -c…' sh {} +`，**字段顺序与 GNU 路保持一致**（解析器不用改） |
-| **`stat -c` 不解释 `\0`** | `-c '%F\0%s'` 输出的是**字面的 `\0` 两个字符** —— busybox 与 GNU **都**这样，只有 `--printf` 才解释 | busybox 退路的 NUL 由 `printf '%s\0'` 产出（实测两个实现都认） |
-
-**探测 shell 时的两条硬约束**（都是被测试抓出来的，不是我事先想到的）：
-
-1. **必须占并发槽位 + 单飞**：否则 16 路并发会冒出 16 个 `wsl.exe`，
-   而**并发上限 4 是实测底线**（8 路以上会把 relay 打到 30 秒级停顿）。
-2. **致命错误与超时照旧上抛**：`Wsl/E_DISTRO_NOT_FOUND` 说的是「发行版不存在」，
-   **不是**「这个 shell 没有」；把超时说成「没有 shell」就是**谎报原因**。
-
-> **验证方式**：`wsl -d docker-desktop`（busybox）与 `wsl -d Ubuntu-24.04`（GNU）
-> **各跑一遍**列目录 —— 两条路都要过。只测 Ubuntu 会漏掉整条 busybox 退路。
-
-### 4.27 想给插件加「设置项」？走宿主的 `configEditor`（附 Entry 形状的坑）
-
-**别自己写配置文件。** 宿主有 `configEditor`（软取：`ctx.get('configEditor')`）：
-
-| 方法 | 用途 |
-|---|---|
-| `entries()` | 可寻址的 profile 行 |
-| `configuration()` | 读继承值 + 显式覆盖值 |
-| `edit(entry, change)` | **校验 + 持久化 + 走正常 Loader 路径重新应用**（插件会重载） |
-
-**⚠️ `Entry` 的形状别猜**（2026-10-09 实测）：
-
-```js
-{ id: 'include:multi-remote', name: null, patchId: null,
-  options: { name: '@jk-uzi/dsh-multi-remote' }, /* loader, ctx, fiber, parent, … */ }
-```
-
-包名在 **`entry.options.name`** 里；`entry.name` 与 `entry.patchId` 都是 `null`。
-按 `entry.name` 找会**永远找不到** —— 症状是用户点保存得到「找不到本插件那一行」。
-**拿不准就先 dump 一次**（`entries().map(e => Object.keys(e))`），别照名字猜。
-
-两条产品约束：
-
-1. **保存 = 插件重载** → 界面上必须明说「已连接的远程工作区会断开，重连一次即可」。
-2. **服务可能不在场** → 写进 `inject` 会让没有它的 profile **整个插件挂不上**；
-   所以用 `ctx.get()` 软取，取不到就**如实说改不了**并给手工办法，**不假装有开关**。
-
-> 落点说明：`edit()` 会往 profile 的 `cordis.patch.yml` 写一条
-> `- id: <你的行 id>` + `config: {...}` 的**定向覆盖**（patch 文件头部那套机制）。
-> 所以你的行 id 必须**全局唯一**且稳定。
-
-## 5. 代码约定
-
-- **零运行时 npm 依赖**是目标。确需引入依赖时，请在 PR 描述里说明理由。
-- 平台：Windows 优先（WSL 档依赖），macOS / Linux 上 SSH + Docker 可用。
-- 目标环境一律要求 **POSIX shell**；原生 Windows 远端（WinRM / SSH→Windows）不在范围内。
-- 安全红线（评审会重点看）：
-  - 路径围栏判定必须发生在 **`realpath` 之后**，防符号链接逃逸；拒绝时用 `FS_SANDBOX_DENIED`。
-  - 凭据不落明文、不回显，凭据文件权限 `0600`。
-    **什么算凭据**：私钥**内容**、口令、passphrase、agent socket —— 这四样永不落盘、永不回显。
-    **私钥「路径」不算**（`~/.ssh/id_ed25519` 认证不了任何人），它落盘、也回显给界面 ——
-    因为「用过的连接」正是靠它才能一键填好，否则用户每次都要重敲一遍。
-    这条边界由测试钉住（`SENSITIVE_FIELDS` + `describeProfiles` 的白名单断言），
-    **要加新的认证相关字段，先想清楚它是不是凭据**。
-  - 破坏性操作（删除、停止容器等）必须显式确认。
-  - **不谎报沙箱事实**：远端命令不受本地沙箱约束时，要在提示里说明边界是目标账号自身权限。
-- 提交信息：`type(scope): 摘要`
-  - `type ∈ {feat, fix, docs, chore, refactor, test, spike}`
-  - `scope ∈ {fs, shell, ssh, wsl, docker, tools, ui, docs, repo}`
-  - 例：`feat(ssh): 用 ssh2 实现 Transport.readFile`
-
 ### 4.25 想给客户端加界面入口？**先读这次真机事故**
 
 2026-10-07 我们把「远程开发」做在了侧边栏「工作区」旁 `+` 按钮的
@@ -733,7 +661,109 @@ Error: web boot: 1 entry did not activate
 `/multi-remote/client-report` 写进审计日志，「点了没反应」这种问题
 从服务端就能定位，不用猜。
 
-## 6. 提 PR## 6. 提 PR
+### 4.26 WSL 发行版不一定是 GNU：busybox 的三条坑（实测）
+
+Docker Desktop 的 `docker-desktop` 发行版是 **busybox**（BusyBox v1.37），
+Alpine-on-WSL 也是。拿它当目标时实测踩到三条：
+
+| 坑 | 现象 | 解法 |
+|---|---|---|
+| **没有 `bash`** | `execvpe(bash) failed: No such file or directory` | 连接时探测一次：优先 `bash -lc`，没有就 `sh -c` —— **POSIX shell 才是硬要求** |
+| **`find` 没有 `-printf`** | `find: unrecognized: -printf` | 退到 `find -exec sh -c '…stat -c…' sh {} +`，**字段顺序与 GNU 路保持一致**（解析器不用改） |
+| **`stat -c` 不解释 `\0`** | `-c '%F\0%s'` 输出的是**字面的 `\0` 两个字符** —— busybox 与 GNU **都**这样，只有 `--printf` 才解释 | busybox 退路的 NUL 由 `printf '%s\0'` 产出（实测两个实现都认） |
+
+**探测 shell 时的两条硬约束**（都是被测试抓出来的，不是我事先想到的）：
+
+1. **必须占并发槽位 + 单飞**：否则 16 路并发会冒出 16 个 `wsl.exe`，
+   而**并发上限 4 是实测底线**（8 路以上会把 relay 打到 30 秒级停顿）。
+2. **致命错误与超时照旧上抛**：`Wsl/E_DISTRO_NOT_FOUND` 说的是「发行版不存在」，
+   **不是**「这个 shell 没有」；把超时说成「没有 shell」就是**谎报原因**。
+
+> **验证方式**：`wsl -d docker-desktop`（busybox）与 `wsl -d Ubuntu-24.04`（GNU）
+> **各跑一遍**列目录 —— 两条路都要过。只测 Ubuntu 会漏掉整条 busybox 退路。
+
+### 4.27 想给插件加「设置项」？走宿主的 `configEditor`（附 Entry 形状的坑）
+
+**别自己写配置文件。** 宿主有 `configEditor`（软取：`ctx.get('configEditor')`）：
+
+| 方法 | 用途 |
+|---|---|
+| `entries()` | 可寻址的 profile 行 |
+| `configuration()` | 读继承值 + 显式覆盖值 |
+| `edit(entry, change)` | **校验 + 持久化 + 走正常 Loader 路径重新应用**（插件会重载） |
+
+**⚠️ `Entry` 的形状别猜**（2026-10-09 实测）：
+
+```js
+{ id: 'include:multi-remote', name: null, patchId: null,
+  options: { name: '@jk-uzi/dsh-multi-remote' }, /* loader, ctx, fiber, parent, … */ }
+```
+
+包名在 **`entry.options.name`** 里；`entry.name` 与 `entry.patchId` 都是 `null`。
+按 `entry.name` 找会**永远找不到** —— 症状是用户点保存得到「找不到本插件那一行」。
+**拿不准就先 dump 一次**（`entries().map(e => Object.keys(e))`），别照名字猜。
+
+两条产品约束：
+
+1. **保存 = 插件重载** → 界面上必须明说「已连接的远程工作区会断开，重连一次即可」。
+2. **服务可能不在场** → 写进 `inject` 会让没有它的 profile **整个插件挂不上**；
+   所以用 `ctx.get()` 软取，取不到就**如实说改不了**并给手工办法，**不假装有开关**。
+
+> 落点说明：`edit()` 会往 profile 的 `cordis.patch.yml` 写一条
+> `- id: <你的行 id>` + `config: {...}` 的**定向覆盖**（patch 文件头部那套机制）。
+> 所以你的行 id 必须**全局唯一**且稳定。
+
+### 4.28 Windows 上别用 PowerShell 的 `Set-Content` / `Add-Content` 改仓库文件
+
+`.gitattributes` 规定全仓库 **LF**（本插件没有构建步骤，宿主直接加载 `src/*.js`；
+目标环境一律 POSIX shell，CRLF 会让脚本跑不起来、diff 全是噪音）。
+而在 Windows 上，PowerShell 的 `Set-Content` / `Add-Content` **默认写 CRLF**
+（`Out-File` 还可能带 BOM）—— `.gitattributes` 只管入库时的归一化，
+**拦不住工作区里已经写坏的文件**。
+
+这个仓库**实测踩到两次**（2026-10-09：`CONTRIBUTING.md` 重排章节、`.gitignore` 追加一行），
+症状是 `git diff` 报 `CRLF will be replaced by LF`，且整文件的行尾全变。
+
+**正确写法**（LF、无 BOM，二者都显式）：
+
+```powershell
+[System.IO.File]::WriteAllText($path, ($text -replace "`r`n", "`n"),
+  (New-Object System.Text.UTF8Encoding($false)))
+```
+
+提交前自查一次：
+
+```powershell
+# 有输出 = 有 CRLF 残留
+git ls-files | ForEach-Object {
+  if ((Get-Content $_ -Raw) -match "`r") { "CRLF: $_" }
+}
+```
+
+> 更省心的办法：改文件用编辑器或 `git add --renormalize .`，
+> 把 PowerShell 只留给「跑命令」，不用来「写文件」。
+
+## 5. 代码约定
+
+- **零运行时 npm 依赖**是目标。确需引入依赖时，请在 PR 描述里说明理由。
+- 平台：Windows 优先（WSL 档依赖），macOS / Linux 上 SSH + Docker 可用。
+- 目标环境一律要求 **POSIX shell**；原生 Windows 远端（WinRM / SSH→Windows）不在范围内。
+- 安全红线（评审会重点看）：
+  - 路径围栏判定必须发生在 **`realpath` 之后**，防符号链接逃逸；拒绝时用 `FS_SANDBOX_DENIED`。
+  - 凭据不落明文、不回显，凭据文件权限 `0600`。
+    **什么算凭据**：私钥**内容**、口令、passphrase、agent socket —— 这四样永不落盘、永不回显。
+    **私钥「路径」不算**（`~/.ssh/id_ed25519` 认证不了任何人），它落盘、也回显给界面 ——
+    因为「用过的连接」正是靠它才能一键填好，否则用户每次都要重敲一遍。
+    这条边界由测试钉住（`SENSITIVE_FIELDS` + `describeProfiles` 的白名单断言），
+    **要加新的认证相关字段，先想清楚它是不是凭据**。
+  - 破坏性操作（删除、停止容器等）必须显式确认。
+  - **不谎报沙箱事实**：远端命令不受本地沙箱约束时，要在提示里说明边界是目标账号自身权限。
+- 提交信息：`type(scope): 摘要`
+  - `type ∈ {feat, fix, docs, chore, refactor, test, spike}`
+  - `scope ∈ {fs, shell, ssh, wsl, docker, tools, ui, docs, repo}`
+  - 例：`feat(ssh): 用 ssh2 实现 Transport.readFile`
+
+## 6. 提 PR
 
 1. 先开 Issue 描述你要做什么（大改动请先讨论方案，避免白做）。
 2. Fork → 分支开发 → 保持提交聚焦，一次提交只做一件事。

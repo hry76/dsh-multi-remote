@@ -56,6 +56,9 @@
     "./transport/registry.js": {
       "default": "./src/transport/registry.js"
     },
+    "./transport/ssh.js": {
+      "default": "./src/transport/ssh.js"
+    },
     "./transport/wsl.js": {
       "default": "./src/transport/wsl.js"
     },

@@ -17,7 +17,7 @@
  *    而界面上却显示已连上远程 —— 这是本项目最坏的失败模式。
  *
  * 2. **预设行的 `name` 必须是可解析的模块 specifier**（包名或包子路径）。
- *    用绝对文件路径（`D:/...`）会因被当成 URL 协议而**永不启动**，
+ *    用绝对文件路径（`<盘符>:/...`）会因被当成 URL 协议而**永不启动**，
  *    诊断显示 `never started`、`entry.fiber === undefined`。
  *
  * 3. **注册/激活失败只写一条 warn、不抛错**（宿主 `activate()` 里
@@ -34,37 +34,26 @@
  * 先建会话 → 再连远程                                  ❌ 换不了
  * ```
  */
-import { createHash } from 'node:crypto'
-
 import { PLAN_MODE_SECTION } from './plan-mode-section.js'
 
 /** 预设 id 前缀。带前缀是为了不与其它插件（例如 remote-ssh 类）生成的 id 撞车。 */
 export const PRESET_ID_PREFIX = 'multi-remote'
 
+/**
+ * **单一远程模式的预设 id（固定，不派生）**。
+ *
+ * 方案 A（2026-10-09）：预设收敛成一个「远程模式」—— 域内 provider 不再
+ * 绑固定连接，而是按路径动态路由（见 `workspace-routes.js`）。所以预设 id
+ * 与「连接档案 / 远程根」**无关**，永远是这一个。
+ *
+ * 好处：模式选择器里永远只有一个「远程模式」（宿主预设是全局的，每连接一个
+ * 预设就会出现 N 个，且都能被任何会话选到 —— 写错项目）。会话日志里存的
+ * 也是这个稳定 id，重启恢复永远找得到。
+ */
+export const PRESET_ID = PRESET_ID_PREFIX
+
 /** 本插件在预设行里引用的模块 specifier 前缀。必须等于包名。 */
 export const PLUGIN_PACKAGE = '@jk-uzi/dsh-multi-remote'
-
-/**
- * 由一个「连接档案 + 远程根」派生稳定的预设 id。
- *
- * 与锚点目录名用同一套派生规则：**同一对输入永远得到同一个 id**。
- * 这很重要 —— 会话日志里存的是预设 id，重启恢复时按 id 找回定义；
- * id 不稳定会让已存在的会话再也打不开（响亮失败，但用户会一脸懵）。
- *
- * @param {string} profileId
- * @param {string} remoteRoot
- * @returns {string}
- */
-export function presetIdFor(profileId, remoteRoot) {
-  const profile = String(profileId ?? '').trim()
-  const root = String(remoteRoot ?? '').trim()
-  if (profile === '') throw new Error('presetIdFor 需要非空的 profileId')
-  if (root === '') throw new Error('presetIdFor 需要非空的 remoteRoot')
-  const digest = createHash('sha256').update(`${profile}\0${root}`, 'utf8').digest('hex').slice(0, 12)
-  // 点号也必须换掉：参考项目实测 entry id 含点号会让插件树加载失败。
-  const safeProfile = profile.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 24)
-  return `${PRESET_ID_PREFIX}-${safeProfile}-${digest}`
-}
 
 /**
  * 需要隔离的服务名。
@@ -85,7 +74,7 @@ export const ISOLATED_SERVICES = ['fs', 'shell', 'terminals']
  * 与宿主的 `minimal` 预设同一做法：服务本体 + 一个后端。
  * 官方那个本地 shell 后端（`dsh-terminal-bash`）**不挂** ——
  * 挂它要 `sandbox` / `sandbox-policy` / `subprocess`，而我们在 Windows 上
- * 那些沙箱执行器本来就起不来（见 D-003）；而且远程会话本来也不该有本地终端。
+ * 那些沙箱执行器本来就起不来；而且远程会话本来也不该有本地终端。
  * 我们自己的后端由 `world/terminal.js` 在域内注册。
  */
 export const TERMINAL_SERVICE_ROWS = [
@@ -124,7 +113,7 @@ export const TERMINAL_SERVICE_ROWS = [
 export const ISOLATED_TOOL_ROWS = [
   // 命令：`cwd` 必须显式指向**远程根** —— 工具的默认 cwd 是会话工作目录
   // （也就是本机锚点目录），那个路径在远程根本不存在。实测报错是远程 bash 的
-  // `cd: D:\...\anchor: 没有那个文件或目录`。
+  // `cd: <盘符>:\...\anchor: 没有那个文件或目录`。
   { id: 'tool-bash', name: '@deepseek-ai/dsh-tool-bash', withRemoteCwd: true },
 
   // ⭐ **读文件 / 写文件 / 编辑**。它只注入 `fs`，所以只要挂在域内，
@@ -206,7 +195,7 @@ function disabledRow(id) {
   }
 }
 /**
- * 构造一个远程预设定义。
+ * 构造「远程模式」预设定义。
  *
  * 形状与宿主 `agentPresets.register()` 接受的声明一致：
  * 一个 `cordis:group` 行，`isolate` 掉单例服务，组内放我们的 provider。
@@ -214,34 +203,30 @@ function disabledRow(id) {
  * ⚠️ 行里的 `name` **只能是模块 specifier**（包子路径），绝不能是绝对文件路径。
  * 本模块用 `PLUGIN_PACKAGE` 常量拼出来，就是为了让这个约束在代码层面无处可违反。
  *
+ * **方案 A（单一远程模式）**：预设 id 固定 {@link PRESET_ID}，provider 行**不再
+ * 注入 profileId / remoteRoot / anchorPath** —— 域内 provider 靠「路径路由」
+ * （`workspace-routes.js`）动态找到对应的连接，所以一份预设能服务所有远程项目。
+ *
  * @param {object} options
- * @param {string} options.profileId 连接档案标识（预设行据此找到 transport）
- * @param {string} options.remoteRoot
  * @param {string} [options.name] 展示名
  * @param {string} [options.description]
  * @param {number} [options.order]
- * @param {string} [options.anchorPath] 本机锚点目录（供域内 provider 把会话 cwd 翻译成远程路径）
- * @param {string[]} [options.isolate] 默认 {@link ISOLATED_SERVICES}
  * @returns {object} 可直接交给 `agentPresets.register()` 的定义
  */
-export function buildPresetDefinition(options) {
+export function buildPresetDefinition(options = {}) {
   const {
-    profileId,
-    remoteRoot,
     name,
     description,
     order = 500,
-    anchorPath,
-    isolate = ISOLATED_SERVICES,
   } = options
 
-  const id = presetIdFor(profileId, remoteRoot)
+  const id = PRESET_ID
   const groupId = `${id}-world`
 
   return {
     id,
-    name: name ?? `远程：${remoteRoot}`,
-    description: description ?? `文件与命令在 ${remoteRoot} 所在的远程环境执行`,
+    name: name ?? '远程模式',
+    description: description ?? '在已连接的远程项目（SSH / WSL / Docker）里工作',
     order,
     plugins: [
       {
@@ -249,7 +234,7 @@ export function buildPresetDefinition(options) {
         // `cordis:group` 是宿主内置的组行；`group: true` 让它成为隔离域。
         name: 'cordis:group',
         group: true,
-        isolate: Object.fromEntries(isolate.map((service) => [service, true])),
+        isolate: Object.fromEntries(ISOLATED_SERVICES.map((service) => [service, true])),
         config: [
           // `terminals` 服务本体必须在域内挂载 —— 根上下文没有它。
           // 顺序上放最前面：后面的 world-terminal 要注册到它上面。
@@ -257,51 +242,36 @@ export function buildPresetDefinition(options) {
           {
             id: `${id}-world-fs`,
             // 模块 specifier —— 不是文件路径。
-            //
-            // ⚠️ `localAnchorPath` **必须**给：`tool-fs` 会把会话 cwd（= 本机锚点目录）
-            // 传下来，模型也自然会用锚点形态的路径。不给的话会拼出
-            // `D:/.../anchors/mr-x/src/a.js` 这种远程不存在的路径。
+            // 方案 A：不再注入 profileId/remoteRoot/anchorPath —— 域内 fs 按路径路由。
             name: `${PLUGIN_PACKAGE}/world/fs.js`,
-            config: { profileId, remoteRoot, ...anchorPath === undefined ? {} : { localAnchorPath: anchorPath } },
           },
           {
             id: `${id}-world-shell`,
             name: `${PLUGIN_PACKAGE}/world/shell.js`,
-            // localAnchorPath 让域内 shell 能把「会话 cwd = 本机锚点」翻译成远程根
-            config: { profileId, remoteRoot, ...anchorPath === undefined ? {} : { localAnchorPath: anchorPath } },
+            // 方案 A：workdir 翻译时按锚点路由，不再需要固定的 remoteRoot。
           },
           {
             // `glob` / `grep` 的**远程**实现：在域内用远程的 `find` / `grep` 跑
             // （宿主那份用打包在宿主里的 ripgrep + `subprocess`，跑在本机、搜本地镜像）。
             id: `${id}-world-search`,
             name: `${PLUGIN_PACKAGE}/world/search.js`,
-            config: { profileId, remoteRoot, ...anchorPath === undefined ? {} : { localAnchorPath: anchorPath } },
+            // 方案 A：按搜索路径路由，不再注入固定 remoteRoot。
           },
           {
             id: `${id}-world-terminal`,
             name: `${PLUGIN_PACKAGE}/world/terminal.js`,
-            // 终端也必须在**域内**挂载：它持有的 transport 是域内解析到的那个。
-            // 在域外挂载会拿到全局 transport 注册表 —— 开出来的终端连到别的机器。
-            //
-            // `remoteRoot` 是终端初始目录：会话 cwd 是本机锚点目录，
-            // 那个路径在远程根本不存在（与 tool-bash 的 cwd 是同一个坑）。
-            config: { profileId, remoteRoot, label: name ?? profileId },
+            // 终端也必须在**域内**挂载（它注册的后端持域内解析到的 transport）。
+            // 方案 A：开终端时按 cwd 路由到对应连接，不再在挂载时绑死。
           },
           // 工具行必须在**域内**注册：它捕获的是域内的 `ctx.fs` / `ctx.shell`（远程实现）。
           // 在域外注册（或用默认预设的行）会解析到全局实现 —— 操作落在本机。
-          ...ISOLATED_TOOL_ROWS.map((row) => {
-            // `cwd` 只给**需要它的**行（bash 用会话 cwd 当 workdir）。
-            // 给别的行塞一个它们不认的键，轻则被忽略、重则让该行进入 broken。
-            const config = {
-              ...row.withRemoteCwd === true ? { cwd: remoteRoot } : {},
-              ...row.config ?? {},
-            }
-            return {
-              id: row.id,
-              name: row.name,
-              ...Object.keys(config).length === 0 ? {} : { config },
-            }
-          }),
+          // 方案 A：不再给 tool-bash 塞 `cwd: remoteRoot` —— 它默认用会话 cwd（锚点），
+          // 由 world-shell 翻译成远程根并路由。
+          ...ISOLATED_TOOL_ROWS.map((row) => ({
+            id: row.id,
+            name: row.name,
+            ...(row.config === undefined ? {} : { config: row.config }),
+          })),
           // 「大脑」类行：提示词 / AGENTS.md / 技能 / 计划模式。
           // 预设是会话的**完整**插件组合 —— 不挂的行不会从别处继承过来。
           ...BRAIN_ROWS.map((row) => ({ ...row })),
@@ -363,6 +333,23 @@ export class PresetRegistry {
       this.log?.('[preset] 预设 %s 注册成功但激活失败：%s', definition.id, diagnostic.broken)
     }
     return diagnostic
+  }
+
+  /**
+   * 幂等注册：预设已注册就**复用**，只回读诊断；未注册才真正注册。
+   *
+   * 方案 A 需要它：预设收敛成一个「远程模式」，多个连接**共享**这一份 ——
+   * 第一个连接注册，后续连接复用（否则会撞 `Duplicate agent preset`）。
+   *
+   * @param {object} definition 见 {@link buildPresetDefinition}
+   * @returns {Promise<PresetDiagnostic>}
+   * @throws {Error} 注册失败 / 激活失败（在 {@link assertUsable} 里）时抛出
+   */
+  async ensureRegistered(definition) {
+    if (this.disposers.has(definition.id)) {
+      return this.verify(definition.id)
+    }
+    return this.register(definition)
   }
 
   /**
@@ -482,7 +469,7 @@ function validateRow(row, presetId) {
  * 是否是「可解析的模块 specifier」。
  *
  * 明确拒绝的形态：
- *   - 绝对路径：`/x/y.js`、`D:/x/y.js`、`D:\x\y.js`
+ *   - 绝对路径：`/x/y.js`、`<盘符>:/x/y.js`、`<盘符>:\x\y.js`
  *   - URL / 协议：`file:`、`http:` 等（`cordis:group` 这类宿主内置名单独放行）
  *   - 相对路径：`./x.js`、`../x.js`（在预设域里相对谁是不确定的，宿主会当成 URL 解析）
  *

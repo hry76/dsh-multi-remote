@@ -316,6 +316,188 @@ test('materializeTree：单个文件失败不放弃整棵树', async () => {
   })
 })
 
+test('materializeTree：transport 有 readFilesBatch 就走批量，一次拿全', async () => {
+  await withTempDir(async (dir) => {
+    const anchor = join(dir, 'anchor')
+    const base = fakeTransport({ 'a.txt': 'A\n', 'sub/b.txt': 'B\n', 'c.txt': 'C\n' })
+    // 挂上批量能力（模拟 WSL）—— 记录调用，内容从假文件表取
+    const batchCalls = []
+    base.readFilesBatch = async (paths, options) => {
+      batchCalls.push(paths)
+      const out = new Map()
+      for (const path of paths) {
+        const rel = path.replace('/remote/proj/', '').replace('/remote/proj', '')
+        const content = {
+          'a.txt': 'A\n', 'sub/b.txt': 'B\n', 'c.txt': 'C\n',
+        }[rel]
+        if (content === undefined) {
+          out.set(path, { ok: false, error: new TransportError(TRANSPORT_ERROR.NOT_FOUND, '不存在', { operation: 'readFile', target: path }) })
+        } else {
+          out.set(path, { ok: true, data: Buffer.from(content, 'utf8') })
+        }
+      }
+      return out
+    }
+
+    const result = await materializeTree({ transport: base, anchorPath: anchor, remoteRoot: '/remote/proj' })
+
+    // 全部内容都写下来了
+    assert.deepEqual(result.written.map((e) => e.relPath).sort(), ['a.txt', 'c.txt', 'sub/b.txt'])
+    assert.equal(await readFile(join(anchor, 'a.txt'), 'utf8'), 'A\n')
+    assert.equal(await readFile(join(anchor, 'sub', 'b.txt'), 'utf8'), 'B\n')
+    assert.equal(await readFile(join(anchor, 'c.txt'), 'utf8'), 'C\n')
+
+    // **一次**批量调用拿全（这就是 WSL 上 22s→2s 的来源）
+    assert.equal(batchCalls.length, 1, '三个文件应当一批拿全')
+    // 批量路径下不该再走逐个 readFile
+    assert.equal(base.calls.readFile.length, 0, '有批量能力时不应退回逐个读')
+    // 负对照：不用批量 → 197 个文件 197 次 spawn，实测 22 秒
+  })
+})
+
+test('materializeTree：批量整批失败时降级回逐个读（语义不变）', async () => {
+  await withTempDir(async (dir) => {
+    const anchor = join(dir, 'anchor')
+    const base = fakeTransport({ 'a.txt': 'A\n', 'b.txt': 'B\n' })
+    // 批量能力存在但**总是失败**（比如脚本在这个发行版里跑不了）
+    let batchTried = 0
+    base.readFilesBatch = async () => {
+      batchTried += 1
+      throw new TransportError(TRANSPORT_ERROR.UNKNOWN, '批量读失败', { operation: 'readFilesBatch' })
+    }
+
+    const result = await materializeTree({ transport: base, anchorPath: anchor, remoteRoot: '/remote/proj' })
+
+    assert.equal(batchTried, 1, '批量先试了一次')
+    // 降级后内容照样全 —— 用户看到的行为完全一致
+    assert.deepEqual(result.written.map((e) => e.relPath).sort(), ['a.txt', 'b.txt'])
+    assert.equal(await readFile(join(anchor, 'a.txt'), 'utf8'), 'A\n')
+    assert.equal(await readFile(join(anchor, 'b.txt'), 'utf8'), 'B\n')
+    assert.equal(base.calls.readFile.length, 2, '整批失败后逐个读补上')
+    assert.equal(result.errors.length, 0, '降级不产生错误')
+    // 负对照：批量失败直接抛 → 用户看到「打开失败」，而其实退一步就能成
+  })
+})
+
+test('materializeTree：批量里单个文件失败只记那个文件，其余照常', async () => {
+  await withTempDir(async (dir) => {
+    const anchor = join(dir, 'anchor')
+    const base = fakeTransport({ 'a.txt': 'A\n', 'b.txt': 'B\n', 'c.txt': 'C\n' })
+    base.readFilesBatch = async (paths) => {
+      const out = new Map()
+      for (const path of paths) {
+        if (path.endsWith('b.txt')) {
+          out.set(path, { ok: false, error: new TransportError(TRANSPORT_ERROR.PERMISSION_DENIED, '权限不足', { operation: 'readFile', target: path }) })
+        } else {
+          const rel = path.replace('/remote/proj/', '')
+          out.set(path, { ok: true, data: Buffer.from({ 'a.txt': 'A\n', 'c.txt': 'C\n' }[rel], 'utf8') })
+        }
+      }
+      return out
+    }
+
+    const result = await materializeTree({ transport: base, anchorPath: anchor, remoteRoot: '/remote/proj' })
+    assert.deepEqual(result.written.map((e) => e.relPath).sort(), ['a.txt', 'c.txt'])
+    assert.equal(result.errors.length, 1)
+    assert.equal(result.errors[0].code, TRANSPORT_ERROR.PERMISSION_DENIED)
+    assert.equal(await readFile(join(anchor, 'a.txt'), 'utf8'), 'A\n')
+    assert.equal(await readFile(join(anchor, 'c.txt'), 'utf8'), 'C\n')
+    // 负对照：一个文件失败拖垮整批 → 权限问题让整个项目打不开
+  })
+})
+
+test('materializeTree：transport 有 walkTree 就走快路拿结构，内容仍走批量/逐个', async () => {
+  await withTempDir(async (dir) => {
+    const anchor = join(dir, 'anchor')
+    const base = fakeTransport({ 'README.md': 'A\n', 'src/app.js': 'const a=1\n', 'big.bin': 'x' })
+    let walkTreeCalls = 0
+    base.walkTree = async (remoteRoot, options) => {
+      walkTreeCalls += 1
+      // 快路只给**元数据**（无 data）—— 内容交给 readFilesBatch/readFile
+      return {
+        entries: [
+          { relPath: 'src', type: 'directory', mtimeMs: 1 },
+          { relPath: 'README.md', type: 'file', size: 2, mtimeMs: 2 },
+          { relPath: 'src/app.js', type: 'file', size: 10, mtimeMs: 3 },
+          { relPath: 'big.bin', type: 'file', size: 999999, mtimeMs: 4 }, // 超限
+        ],
+        truncated: false,
+        durationMs: 42,
+      }
+    }
+
+    const result = await materializeTree({ transport: base, anchorPath: anchor, remoteRoot: '/remote/proj' })
+
+    assert.equal(walkTreeCalls, 1, '有 walkTree 就只走一次快路')
+    assert.equal(base.calls.readdir.length, 0, '快路不走 readdir')
+    // 内容仍走标准拉取（这里没有 readFilesBatch，所以逐个 readFile）
+    assert.equal(base.calls.readFile.length, 2, '两个小文件走 readFile 拉内容')
+
+    // 文件内容写下来了
+    assert.equal(await readFile(join(anchor, 'README.md'), 'utf8'), 'A\n')
+    assert.equal(await readFile(join(anchor, 'src', 'app.js'), 'utf8'), 'const a=1\n')
+    // 目录骨架建出来了
+    assert.ok((await stat(join(anchor, 'src'))).isDirectory())
+    // 超限文件留占位
+    const placeholder = await readFile(join(anchor, 'big.bin'), 'utf8')
+    assert.match(placeholder, /dsh-multi-remote:not-synced/)
+    // 统计正确
+    assert.equal(result.written.length, 2, '两个小文件落盘')
+    assert.equal(result.oversized.length, 1, '一个大文件占位')
+    assert.equal(result.stats.viaFind, true)
+    // 负对照：无视 walkTree 能力 → 又退回逐目录 readdir
+  })
+})
+
+test('materializeTree：walkTree 探测失败时静默退回标准路（语义不变）', async () => {
+  await withTempDir(async (dir) => {
+    const anchor = join(dir, 'anchor')
+    const base = fakeTransport({ 'a.txt': 'A\n', 'b.txt': 'B\n' })
+    let walkTreeTried = 0
+    base.walkTree = async () => {
+      walkTreeTried += 1
+      throw new TransportError(TRANSPORT_ERROR.UNKNOWN, '远端没有 GNU find', { operation: 'walkTree' })
+    }
+
+    const result = await materializeTree({ transport: base, anchorPath: anchor, remoteRoot: '/remote/proj' })
+
+    assert.equal(walkTreeTried, 1, '快路先试了一次')
+    assert.deepEqual(result.written.map((e) => e.relPath).sort(), ['a.txt', 'b.txt'], '降级后内容照常')
+    assert.equal(await readFile(join(anchor, 'a.txt'), 'utf8'), 'A\n')
+    assert.equal(base.calls.readFile.length, 2, '退回标准路逐个读')
+    assert.equal(result.stats.viaFind, undefined, '统计里不该标 viaFind')
+    assert.equal(result.errors.length, 0, '降级不产生错误')
+    // 负对照：walkTree 失败直接抛 → 用户看到「打开失败」，而退一步就能成
+  })
+})
+
+test('materializeTree：walkTree 快路也要应用忽略规则（目录整棵剪掉）', async () => {
+  await withTempDir(async (dir) => {
+    const anchor = join(dir, 'anchor')
+    // walkTree 返回全量（含 node_modules 及子孙）—— 快路必须像标准路一样剪掉忽略目录
+    const base = fakeTransport({ 'keep.txt': 'K\n' })
+    base.walkTree = async () => ({
+      entries: [
+        { relPath: 'keep.txt', type: 'file', size: 2, mtimeMs: 1 },
+        { relPath: 'node_modules', type: 'directory', mtimeMs: 1 },
+        { relPath: 'node_modules/evil.js', type: 'file', size: 10, mtimeMs: 1 },
+        { relPath: 'node_modules/deep/', type: 'directory', mtimeMs: 1 },
+        { relPath: 'node_modules/deep/x.js', type: 'file', size: 10, mtimeMs: 1 },
+      ],
+      truncated: false,
+      durationMs: 1,
+    })
+
+    const result = await materializeTree({ transport: base, anchorPath: anchor, remoteRoot: '/remote/proj' })
+
+    // node_modules 及子孙都被剪掉，只有 keep.txt 落盘
+    assert.deepEqual(result.written.map((e) => e.relPath), ['keep.txt'])
+    assert.equal(base.calls.readFile.length, 1, '只有 keep.txt 拉内容')
+    await assert.rejects(() => stat(join(anchor, 'node_modules')), /ENOENT/, '被忽略目录不该建骨架')
+    // 负对照：快路不应用 ignore → node_modules 整个被拉下来（12659 文件项目里就是灾难）
+  })
+})
+
 test('materializeTree：符号链接与特殊文件不搬内容', async () => {
   await withTempDir(async (dir) => {
     const anchor = join(dir, 'anchor')

@@ -21,6 +21,7 @@
  * 白白多绕一圈，还失去了 `remote_bash` 的输出上限与超时保护。
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { routeByAnchorPath } from '../session/workspace-routes.js'
 
 /** 终端会话在工具参数里的标识（模型看到的是短 id，不是宿主的长 id）。 */
 const SESSION_PREFIX = 'term'
@@ -130,10 +131,19 @@ export function buildTerminalTool(options) {
       try {
         switch (action) {
           case 'open': {
+            // 方案 A：终端按 cwd 路由。agent 没指定 cwd 时，按**会话 cwd（锚点）**
+            // 路由出对应项目的远程根 —— 这样默认就开在正确项目里。
+            let cwd = typeof args.cwd === 'string' && args.cwd.trim() !== '' ? args.cwd : undefined
+            if (cwd === undefined) {
+              cwd = routeByAnchorPath(exec.agent?.session?.header?.cwd)?.remoteRoot
+            }
+            if (cwd === undefined) {
+              return { ok: false, message: '无法确定终端连到哪个远程项目（请先打开对应项目，或指定 cwd）。' }
+            }
             const spawned = await terminals.spawn(agent, {
               type: 'remote-shell',
               ...args.name === undefined ? {} : { name: String(args.name) },
-              ...args.cwd === undefined ? {} : { cwd: String(args.cwd) },
+              cwd: String(cwd),
             })
             const id = shortId(spawned.sessionId)
             idMap.set(id, spawned.sessionId)

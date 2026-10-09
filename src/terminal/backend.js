@@ -125,27 +125,24 @@ class RemoteBackendSession {
 }
 
 /**
- * 宿主 `TerminalBackend` 实现：每个实例绑定一个**具体的远程连接**。
+ * 宿主 `TerminalBackend` 实现。
  *
- * 生命周期：连接建立时创建、断开时销毁。它不做连接管理 ——
- * 那是 `ConnectionManager` 的事。这里只回答「在这个连接上开一个终端」。
+ * **方案 A（单一远程模式）**：后端**不再绑定固定连接** —— 每次 `spawn` 按
+ * `spec.cwd`（远程初始目录）路由到对应工作区的 transport。这样一份预设
+ * 能服务所有远程项目，开出来的终端永远连到正确的机器。
  */
 export class RemoteTerminalBackend {
   /**
    * @param {object} options
-   * @param {import('../transport/transport.js').Transport} options.transport
-   * @param {string} options.label 给模型看的「这是哪台机器」
-   * @param {string} [options.cwd] 终端初始目录（远程绝对路径）
-   * @param {Partial<import('./session.js').TERMINAL_DEFAULTS>} [options.tuning]
+   * @param {(cwd: string) => object|undefined} options.route 由远程 cwd 路由到 transport
+   * @param {string} [options.label] 给模型看的「这是哪台机器」
    * @param {(message: string, ...rest: unknown[]) => void} [options.log]
    * @param {string} [options.type] 后端类型名（默认 {@link REMOTE_TERMINAL_TYPE}）
    */
   constructor(options) {
-    if (options?.transport === undefined) throw new Error('RemoteTerminalBackend 需要 transport')
-    this.transport = options.transport
-    this.label = options.label ?? options.transport.kind
-    this.cwd = options.cwd
-    this.tuning = options.tuning
+    if (typeof options?.route !== 'function') throw new Error('RemoteTerminalBackend 需要 route(cwd)')
+    this.route = options.route
+    this.label = options.label ?? '远程'
     this.log = options.log
     this.type = options.type ?? REMOTE_TERMINAL_TYPE
   }
@@ -157,8 +154,16 @@ export class RemoteTerminalBackend {
    * @returns {Promise<RemoteBackendSession>}
    */
   async spawn(spec) {
-    const session = await this.transport.spawnTerminal({
-      cwd: spec.cwd ?? this.cwd,
+    const cwd = spec.cwd
+    if (typeof cwd !== 'string' || cwd === '') {
+      throw new Error('远程终端需要指定初始目录（cwd）才能确定连到哪个远程项目')
+    }
+    const transport = this.route(cwd)
+    if (transport === undefined) {
+      throw new Error(`初始目录 "${cwd}" 不属于任何已连接的远程项目（请先打开对应项目）`)
+    }
+    const session = await transport.spawnTerminal({
+      cwd,
       cols: 80,
       rows: 24,
       signal: spec.signal,
@@ -166,17 +171,16 @@ export class RemoteTerminalBackend {
 
     if (session === undefined) {
       throw new Error(
-        `后端 "${this.transport.kind}" 不支持交互式终端。` +
+        `后端 "${transport.kind}" 不支持交互式终端。` +
         '（不会退化成一个没有 PTY 的假终端 —— 那会在 sudo、密码输入、top 这类场景静默出错。）',
       )
     }
-    if (this.tuning !== undefined) Object.assign(session.tuning, this.tuning)
 
     // 启动横幅：告诉模型/用户这是哪个后端的终端，以及 PTY 的真实能力。
     const ptyNote = session.pty
       ? 'PTY 已分配'
       : '⚠️ 没有 PTY（只是管道）—— 交互式程序、密码输入、全屏 TUI 可能不正常'
-    const motd = `已连接到 ${this.label}（${this.transport.kind} 后端）\n${ptyNote}\n`
+    const motd = `已连接到 ${this.label}（${transport.kind} 后端）\n${ptyNote}\n`
 
     this.log?.('[terminal] 已开远程终端：%s（pty=%s）', this.label, session.pty)
     return new RemoteBackendSession(session, motd)

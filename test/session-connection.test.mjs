@@ -8,15 +8,16 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, mkdir } from 'node:fs/promises'
+import { mkdtemp, rm, mkdir, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { normalizeProfile, describeProfile, findLeakedSecrets, ProfileError, anchorPathOf } from '../src/session/profile.js'
 import { ROOT_CHECK_MARKER } from '../src/session/verify-root.js'
 import { ConnectionManager, RemoteWorkspace, defaultAnchorParent } from '../src/session/connection.js'
-import { PresetRegistry } from '../src/session/preset.js'
-import { registeredProfileIds, clearTransports } from '../src/transport/registry.js'
+import { PresetRegistry, PRESET_ID } from '../src/session/preset.js'
+import { registeredProfileIds, clearTransports, clearMirrors } from '../src/transport/registry.js'
+import { clearWorkspaceRoutes } from '../src/session/workspace-routes.js'
 import { TRANSPORT_ERROR, TransportError } from '../src/transport/transport.js'
 
 const SECRET = 'super-secret-password-xyz'
@@ -161,6 +162,8 @@ async function withTempDir(fn) {
     return await fn(dir)
   } finally {
     clearTransports()
+    clearMirrors()
+    clearWorkspaceRoutes()
     await rm(dir, { recursive: true, force: true })
   }
 }
@@ -236,7 +239,7 @@ test('normalizeProfile：多问题一次性全报，而不是挤牙膏', () => {
   // 负对照：遇错即 return，用户要改五轮才知道全部问题
 })
 
-// ── WSL 档案（M2） ──────────────────────────────────────────────────────────
+// ── WSL 档案 ──────────────────────────────────────────────────────────
 
 test('normalizeProfile：WSL 档案不需要任何凭据，只要发行版名', () => {
   const profile = normalizeProfile({
@@ -389,8 +392,8 @@ test('ConnectionManager.connect：成功时建镜像、注册预设、返回报�
 
     await manager.disconnect('conn-1')
     assert.deepEqual(registeredProfileIds(), [], '断开后 transport 应当注销')
-    assert.deepEqual(registry.registeredIds, [], '断开后预设应当注销')
-    // 负对照：断开不注销预设，重连会撞 Duplicate agent preset
+    assert.deepEqual(registry.registeredIds, [PRESET_ID], '断开后预设**仍在**（常驻，供其它连接/会话复用）')
+    // 负对照：断开就注销预设 → 另一个还活着的连接/历史会话的预设没了，会话打不开
   })
 })
 
@@ -434,10 +437,9 @@ test('ConnectionManager.connect：预设激活失败时拒绝连接（绝不静�
     deepenEnabled: false,
     })
 
-    // 让这个档案派生出的预设 id 一定「激活失败」
+    // 让「远程模式」预设（固定 id）激活失败
     const profile = validProfile({ anchorParent: dir })
-    const { presetIdFor } = await import('../src/session/preset.js')
-    agentPresets.broken.add(presetIdFor(profile.id, profile.remoteRoot))
+    agentPresets.broken.add(PRESET_ID)
 
     await assert.rejects(
       () => manager.connect(profile),
@@ -514,7 +516,7 @@ test('ConnectionManager.disconnectAll：一次收干净，幂等', async () => {
     assert.equal(summary.removed, 2)
     assert.equal(summary.failed, 0)
     assert.deepEqual(registeredProfileIds(), [])
-    assert.deepEqual(registry.registeredIds, [])
+    assert.deepEqual(registry.registeredIds, [PRESET_ID], '断开全部后预设仍常驻（插件卸载时才注销）')
     assert.equal(await manager.disconnect('c1'), false, '重复断开返回 false，不抛错')
     // 负对照：串行 await 不 catch，第一个失败会让后面的连接残留
   })
@@ -540,5 +542,54 @@ test('RemoteWorkspace.describe：不泄漏凭据，且给出锚点与预设状�
     assert.equal(described.presetUsable, true)
     assert.ok(described.anchorPath)
     // 负对照：list() 直接返回 profile，口令会进工具输出
+  })
+})
+
+test('RemoteWorkspace.connect：onProgress 按序上报各阶段', async () => {
+  await withTempDir(async (dir) => {
+    const agentPresets = fakeAgentPresets()
+    const registry = new PresetRegistry({ agentPresets })
+    const manager = new ConnectionManager({
+      agentPresets,
+      presetRegistry: registry,
+      createTransport: () => fakeTransport(),
+      deepenEnabled: false,
+    })
+
+    const seen = []
+    await manager.connect(validProfile({ anchorParent: dir }), {
+      onProgress: (progress) => {
+        if (seen[seen.length - 1] !== progress.phase) seen.push(progress.phase)
+      },
+    })
+
+    // walk / fetch 会连续报多次（每个条目/文件一次），去重后应是严格的阶段顺序
+    assert.deepEqual(seen, ['connect', 'verify', 'walk', 'fetch', 'preset'])
+    // 负对照：不报 walk/fetch，前端就只能在「正在连接…」里干等
+  })
+})
+
+test('RemoteWorkspace.connect：镜像已建但预设失败时，半截锚点被删掉', async () => {
+  await withTempDir(async (dir) => {
+    const agentPresets = fakeAgentPresets()
+    const registry = new PresetRegistry({ agentPresets })
+    const manager = new ConnectionManager({
+      agentPresets,
+      presetRegistry: registry,
+      createTransport: () => fakeTransport(),
+      deepenEnabled: false,
+    })
+    const profile = validProfile({ anchorParent: dir })
+    agentPresets.broken.add(PRESET_ID)
+
+    await assert.rejects(
+      () => manager.connect(profile),
+      /拒绝让会话在本机降级运行/,
+    )
+
+    // 失败后锚点目录被 removeAnchor 删干净（不留半截镜像）
+    const leftover = await readdir(dir)
+    assert.deepEqual(leftover, [], '失败后锚点目录应该被删干净')
+    // 负对照：只 disconnect 不删锚点 → 留下半截镜像，下次打开拿到不完整的项目
   })
 })

@@ -193,19 +193,17 @@ test('describeConnected：三种后端的 target 文案', () => {
 
 test('normalizeSettingsPatch：只认白名单字段，MiB 换算成字节', () => {
   const patch = normalizeSettingsPatch({
-    workspaceFlow: false,
     auditCapacity: 1000,
     mirrorDeepen: { enabled: false, maxFileBytesMiB: 4, maxTotalBytesMiB: 128 },
   })
-  assert.equal(patch.workspaceFlow, false)
   assert.equal(patch.auditCapacity, 1000)
   assert.equal(patch.mirrorDeepen.enabled, false)
   assert.equal(patch.mirrorDeepen.maxFileBytes, 4 * 1024 * 1024)
   assert.equal(patch.mirrorDeepen.maxTotalBytes, 128 * 1024 * 1024)
 
   // 白名单：不认识的字段**直接忽略**，不许进配置
-  const sneaky = normalizeSettingsPatch({ workspaceFlow: true, profileStoreDir: '/etc', trustedHosts: ['evil'] })
-  assert.deepEqual(Object.keys(sneaky), ['workspaceFlow'])
+  const sneaky = normalizeSettingsPatch({ auditCapacity: 900, profileStoreDir: '/etc', trustedHosts: ['evil'] })
+  assert.deepEqual(Object.keys(sneaky), ['auditCapacity'])
   // 负对照：整包往下传 → 界面（或任何一个 XSS）能改插件的任意配置
 })
 
@@ -215,7 +213,7 @@ test('normalizeSettingsPatch：非法值明确抛错，不静默取默认', () =
     [],
     'x',
     {},                                   // 什么都没改
-    { workspaceFlow: 'yes' },
+    { auditCapacity: 'many' },
     { auditCapacity: 1 },                 // 低于下限
     { auditCapacity: 1.5 },               // 不是整数
     { auditCapacity: 999999 },            // 高于上限
@@ -277,7 +275,7 @@ test('deriveConnectId：退化场景不产生空串或怪名字', () => {
 // ── 工作区命名：只取最后一层目录 ─────────────────────────────────────────────
 
 test('workspaceTitle：`后端:最后一层目录`（短，且能看出是哪台机器）', () => {
-  // 演进（用户三次反馈）：锚点名 → ssh:/home/user/my-proj/my-proj（太长）→ my-proj（看不出机器）→ 现在
+  // 演进（用户三次反馈）：锚点名 → ssh:/data/my-proj/my-proj（太长）→ my-proj（看不出机器）→ 现在
   assert.equal(workspaceTitle('ssh', '/home/user/my-proj/my-proj'), 'ssh:my-proj')
   assert.equal(workspaceTitle('ssh', '/home/user/桌面/demo-app'), 'ssh:demo-app')
   assert.equal(workspaceTitle('wsl', '/home/user/test-proj'), 'wsl:test-proj')

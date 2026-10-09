@@ -88,6 +88,8 @@ window.__ModuleLoader__.load({
     var ROUTE_MACHINE_CONNECT = '/multi-remote/machine-connect'
     var ROUTE_MACHINE_LIST = '/multi-remote/machine-list'
     var ROUTE_MACHINE_OPEN = '/multi-remote/machine-open'
+    var ROUTE_OPEN_PROGRESS = '/multi-remote/open-progress'
+    var ROUTE_OPEN_CANCEL = '/multi-remote/open-cancel'
     var ROUTE_OPEN_WORKSPACE = '/multi-remote/open-workspace'
     /** 插件设置：读当前值 / 改配置（改配置走宿主的 configEditor）。 */
     var ROUTE_SETTINGS = '/multi-remote/settings'
@@ -161,14 +163,13 @@ window.__ModuleLoader__.load({
 
         loading: '正在读取当前设置…',
         notEditable: '这个 profile 没有 configEditor 服务，界面改不了配置 —— 可以手工改 profile 的 cordis.patch.yml 里 multi-remote 那一行的 config。',
-        entryLabel: '在侧边栏显示「远程开发」',
-        entryHint: '关掉之后那一行不再出现（remote_* 工具与这一页仍在）。',
         deepenLabel: '连上之后在后台补拉镜像',
         deepenHint: '把「文本类 + 上限内」的文件补到本地镜像，界面里点开就有内容；不阻塞连接。',
-        maxFileLabel: '单个文件上限（MiB）',
-        maxTotalLabel: '总量上限（MiB）',
+        maxFileLabel: '后台补拉的单个文件上限（MiB）',
+        maxTotalLabel: '后台补拉的总量上限（MiB）',
         auditLabel: '审计日志条数上限',
-        reloadWarning: '保存后会重载插件 —— 已连接的远程工作区会断开，重新连一次即可。',
+        reloadWarning: '保存后会重载插件：已连接的远程工作区会断开（重连一次即可）。'
+          + '侧边栏入口的开关若没立刻生效，刷新一次页面。',
         save: '保存',
         saving: '正在保存…',
         saved: '已保存。',
@@ -200,6 +201,18 @@ window.__ModuleLoader__.load({
         tooManyDirs: '子文件夹太多，只显示前 200 个',
         filesHere: '个文件（这里只列文件夹）',
         openHere: '就用这个文件夹',
+        openingProject: '正在打开远程项目',
+        phaseConnect: '连接机器',
+        phaseVerify: '验证项目根',
+        phaseWalk: '遍历目录结构',
+        phaseFetch: '拉取文件内容',
+        phasePreset: '建立工作区',
+        done: '完成',
+        waiting: '等待',
+        visitedCount: '已遍历 {n} 条',
+        fetchCount: '{done} / {total} 个文件',
+        openCancelled: '已取消，同步下来的内容已清理',
+        openFailed: '打开失败',
         machineConnected: '已连接的机器',
         pickDistro: '选择发行版',
         pickContainer: '选择容器',
@@ -237,14 +250,13 @@ window.__ModuleLoader__.load({
 
         loading: 'Loading current settings…',
         notEditable: 'This profile has no configEditor service, so settings cannot be changed here — edit the config of the multi-remote row in the profile cordis.patch.yml instead.',
-        entryLabel: 'Show "Remote development" in the sidebar',
-        entryHint: 'Turn it off to hide that row (the remote_* tools and this page stay).',
         deepenLabel: 'Deepen the mirror in the background after connecting',
         deepenHint: 'Copies text files within the limits into the local mirror so they open instantly; does not block the connection.',
-        maxFileLabel: 'Per-file limit (MiB)',
-        maxTotalLabel: 'Total limit (MiB)',
+        maxFileLabel: 'Deepen: per-file limit (MiB)',
+        maxTotalLabel: 'Deepen: total limit (MiB)',
         auditLabel: 'Audit log capacity',
-        reloadWarning: 'Saving reloads the plugin — connected remote workspaces disconnect; just reconnect.',
+        reloadWarning: 'Saving reloads the plugin: connected remote workspaces disconnect (just reconnect). '
+          + 'If the sidebar-entry toggle does not apply immediately, refresh the page.',
         save: 'Save',
         saving: 'Saving…',
         saved: 'Saved.',
@@ -278,6 +290,18 @@ window.__ModuleLoader__.load({
         tooManyDirs: 'Too many subfolders — showing the first 200',
         filesHere: 'file(s) here (folders only are listed)',
         openHere: 'Use this folder',
+        openingProject: 'Opening remote project',
+        phaseConnect: 'Connect to machine',
+        phaseVerify: 'Verify project root',
+        phaseWalk: 'Scan directory structure',
+        phaseFetch: 'Download files',
+        phasePreset: 'Set up workspace',
+        done: 'Done',
+        waiting: 'Waiting',
+        visitedCount: '{n} entries scanned',
+        fetchCount: '{done} / {total} files',
+        openCancelled: 'Cancelled — the synced content has been cleaned up',
+        openFailed: 'Open failed',
         pickDistro: 'Pick a distribution',
         pickContainer: 'Pick a container',
         newConnection: 'New connection',
@@ -395,7 +419,6 @@ window.__ModuleLoader__.load({
             return Math.max(0, Math.round(value / (1024 * 1024)))
           }
           return {
-            workspaceFlow: config.workspaceFlow !== false,
             auditCapacity: typeof config.auditCapacity === 'number' ? config.auditCapacity : 500,
             deepenEnabled: deep.enabled !== false,
             maxFileMiB: mib(deep.maxFileBytes),
@@ -474,7 +497,6 @@ window.__ModuleLoader__.load({
             setBusy(true)
             setNotice(null)
             postJson(ROUTE_SETTINGS, {
-              workspaceFlow: draft.workspaceFlow,
               auditCapacity: Number(draft.auditCapacity),
               mirrorDeepen: {
                 enabled: draft.deepenEnabled,
@@ -503,14 +525,6 @@ window.__ModuleLoader__.load({
           body.push(React.createElement('div', {
             key: 'divider',
             style: { margin: '16px 0 14px', borderTop: '1px solid ' + T.border1 },
-          }))
-          body.push(React.createElement(Toggle, {
-            key: 'entry',
-            label: t('entryLabel'),
-            hint: t('entryHint'),
-            value: draft.workspaceFlow,
-            disabled: busy,
-            onChange: set('workspaceFlow'),
           }))
           body.push(React.createElement(Toggle, {
             key: 'deepen',
@@ -802,7 +816,7 @@ window.__ModuleLoader__.load({
          * 契约：`{ onClose(), onConnected(workspaceId) }`。
          *
          * ⚠️ **这里没有「打开本机文件夹」** —— 那是 DSH 自己「添加工作区」的活，
-         * 不是远程开发的一部分（用户明确提过：本地的操作不该混进来）。
+         * 不是远程开发的一部分 —— **本地的操作不该混进远程流程**。
          */
         function ConnectDialog(props) {
           var [step, setStep] = React.useState('pick')     // 'pick' | 'browse'
@@ -823,8 +837,14 @@ window.__ModuleLoader__.load({
           // 「先连机器、再选文件夹」的第二步
           var [machine, setMachine] = React.useState(null)
           var [listing, setListing] = React.useState(null)
+          // 打开任务（machine-open 任务化后）：{ status, progress, result, error }
+          // status: 'running' | 'done' | 'error' | 'cancelled'
+          var [openTask, setOpenTask] = React.useState(null)
+          // 轮询取消标志：点取消后停止后续轮询（setState 异步，闭包里读不到最新值）
+          var pollCancelled = React.useRef(false)
 
-          var busy = working
+          var opening = openTask !== null && openTask.status === 'running'
+          var busy = working || opening
 
           // 打开就去问宿主：有哪些可选项（识别出来的目标 + 用过的连接）。只问一次。
           React.useEffect(function () {
@@ -1018,25 +1038,79 @@ window.__ModuleLoader__.load({
           }
 
           /**
-           * 第 3 步：把当前目录作为项目打开（完整连接：镜像 + 预设 + 锚点），
-           * 再让宿主把它登记成一个**工作区**，然后关弹窗、切回会话。
+           * 第 3 步：把当前目录作为项目打开（完整连接：镜像 + 预设 + 锚点）。
+           *
+           * 任务化：POST 启动任务 → 立即拿到 taskId → 轮询进度 → 完成时登记工作区。
+           * 大项目打开时界面不再是黑盒「正在连接…」，而是实时阶段进度条。
            */
           function openProject() {
             if (machine === null || listing === null) return
-            setWorking(true)
             setError(null)
-            postJson(ROUTE_MACHINE_OPEN, { machineId: machine.id, remoteRoot: listing.path }, 180000)
+            pollCancelled.current = false
+            setOpenTask({ status: 'running', progress: { phase: 'connect' }, remoteRoot: listing.path })
+            postJson(ROUTE_MACHINE_OPEN, { machineId: machine.id, remoteRoot: listing.path }, 60000)
               .then(function (payload) {
-                if (payload && payload.ok === true && typeof payload.anchorPath === 'string') {
-                  return adoptWorkspace(payload)
+                if (payload && payload.ok === true && typeof payload.taskId === 'string') {
+                  pollProgress(payload.taskId)
+                  return
                 }
-                setWorking(false)
-                setError(t('connectFailed') + ((payload && payload.error) || '未知错误'))
+                setOpenTask({ status: 'error', error: (payload && payload.error) || '未知错误' })
               })
               .catch(function (cause) {
-                setWorking(false)
-                setError(t('connectFailed') + String(cause && cause.message ? cause.message : cause))
+                setOpenTask({ status: 'error', error: String(cause && cause.message ? cause.message : cause) })
               })
+          }
+
+          /** 轮询打开进度，直到 done / error / cancelled。 */
+          function pollProgress(taskId) {
+            if (pollCancelled.current) return
+            getJson(ROUTE_OPEN_PROGRESS + '?task=' + encodeURIComponent(taskId))
+              .then(function (payload) {
+                if (pollCancelled.current) return
+                if (!payload || payload.ok !== true) {
+                  setOpenTask({ status: 'error', error: (payload && payload.error) || '未知错误' })
+                  return
+                }
+                if (payload.status === 'running') {
+                  setOpenTask({ status: 'running', progress: payload.progress || { phase: 'connect' }, taskId: taskId })
+                  setTimeout(function () { pollProgress(taskId) }, 400)
+                  return
+                }
+                if (payload.status === 'done') {
+                  setOpenTask({ status: 'done', result: payload.result })
+                  adoptWorkspace(payload.result)
+                  return
+                }
+                if (payload.status === 'cancelled') {
+                  setOpenTask({ status: 'cancelled' })
+                  return
+                }
+                setOpenTask({ status: 'error', error: payload.error || '未知错误' })
+              })
+              .catch(function (cause) {
+                if (pollCancelled.current) return
+                setOpenTask({ status: 'error', error: String(cause && cause.message ? cause.message : cause) })
+              })
+          }
+
+          /** 取消打开：后端 abort 连接任务，镜像阶段立即中断、删掉半截锚点。 */
+          function cancelOpen() {
+            var task = openTask
+            pollCancelled.current = true
+            if (task !== null && task.taskId !== undefined) {
+              // 取消是**尽力而为**：POST 失败（如任务刚结束）也不影响前端已置的 cancelled。
+              // 后端任务自己会在 connect 失败/取消时删锚点，不会留脏数据。
+              postJson(ROUTE_OPEN_CANCEL, { taskId: task.taskId }, 30000).catch(function (cause) {
+                report('open-cancel', false, String(cause && cause.message ? cause.message : cause))
+              })
+            }
+            setOpenTask({ status: 'cancelled' })
+          }
+
+          /** 回到浏览（取消/失败后）。 */
+          function backToBrowse() {
+            setOpenTask(null)
+            setError(null)
           }
 
           /**
@@ -1083,6 +1157,87 @@ window.__ModuleLoader__.load({
           var content
           var footer
           if (step === 'browse') {
+            if (opening) {
+              // ── B1：打开中 → 列表区原地换成阶段进度卡 ──────────────────
+              var phases = ['connect', 'verify', 'walk', 'fetch', 'preset']
+              var phaseLabel = {
+                connect: t('phaseConnect'), verify: t('phaseVerify'),
+                walk: t('phaseWalk'), fetch: t('phaseFetch'), preset: t('phasePreset'),
+              }
+              var prog = openTask !== null && openTask.progress !== null && typeof openTask.progress === 'object'
+                ? openTask.progress
+                : { phase: 'connect' }
+              var currentIdx = phases.indexOf(prog.phase)
+              if (currentIdx < 0) currentIdx = phases.length - 1
+
+              var progItems = []
+              progItems.push(React.createElement('div', {
+                key: 'title', style: { fontSize: '13px', fontWeight: 600, marginBottom: '4px' },
+              }, t('openingProject')))
+              progItems.push(React.createElement('div', {
+                key: 'path',
+                style: { fontSize: '11px', fontFamily: 'monospace', color: T.label2, marginBottom: '16px', wordBreak: 'break-all' },
+              }, String(openTask.remoteRoot !== undefined ? openTask.remoteRoot : (listing === null ? '' : listing.path))))
+
+              for (var pi = 0; pi < phases.length; pi += 1) {
+                var pphase = phases[pi]
+                var mark, mcolor, mdetail
+                if (pi < currentIdx) { mark = '✓'; mcolor = T.brand; mdetail = t('done') }
+                else if (pi === currentIdx) {
+                  mark = '◐'; mcolor = T.label1
+                  mdetail = pphase === 'walk' && typeof prog.visited === 'number'
+                    ? t('visitedCount').replace('{n}', String(prog.visited))
+                    : pphase === 'fetch' && typeof prog.total === 'number'
+                      ? t('fetchCount').replace('{done}', String(prog.done ?? 0)).replace('{total}', String(prog.total))
+                      : t('connecting')
+                } else { mark = '○'; mcolor = T.label2; mdetail = t('waiting') }
+                progItems.push(React.createElement('div', {
+                  key: 'phase-' + pphase,
+                  style: { display: 'flex', alignItems: 'baseline', fontSize: '12px', marginBottom: '8px' },
+                },
+                  React.createElement('span', { style: { width: '20px', color: mcolor } }, mark),
+                  React.createElement('span', { style: { flex: 1, marginLeft: '6px' } }, phaseLabel[pphase]),
+                  React.createElement('span', { style: { fontSize: '11px', color: T.label2 } }, mdetail),
+                ))
+              }
+
+              if (prog.phase === 'fetch' && typeof prog.total === 'number' && prog.total > 0) {
+                var pct = Math.min(100, Math.round(((prog.done ?? 0) / prog.total) * 100))
+                progItems.push(React.createElement('div', { key: 'bar', style: { marginTop: '12px' } },
+                  React.createElement('div', {
+                    style: { height: '6px', borderRadius: '3px', background: T.bgLayer1, overflow: 'hidden' },
+                  },
+                    React.createElement('div', {
+                      style: { height: '100%', width: pct + '%', background: T.brand, transition: 'width 0.25s' },
+                    })),
+                  React.createElement('div', {
+                    key: 'pct', style: { fontSize: '11px', color: T.label2, marginTop: '6px' },
+                  }, t('fetchCount').replace('{done}', String(prog.done ?? 0)).replace('{total}', String(prog.total)) + ' · ' + pct + '%'),
+                ))
+              }
+
+              content = progItems
+              footer = [
+                React.createElement(ActionButton, { key: 'cancel', label: t('cancel'), onClick: cancelOpen }),
+              ]
+            } else if (openTask !== null && (openTask.status === 'cancelled' || openTask.status === 'error')) {
+              // 取消 / 失败：给结果 + 返回
+              var cancelled = openTask.status === 'cancelled'
+              var resultMsg = cancelled ? t('openCancelled') : t('openFailed') + String(openTask.error ?? '')
+              content = [
+                React.createElement('div', {
+                  key: 'msg',
+                  style: { fontSize: '12px', color: cancelled ? T.label2 : T.error, margin: '10px 0', lineHeight: 1.6, wordBreak: 'break-word' },
+                }, resultMsg),
+              ]
+              footer = [
+                React.createElement(ActionButton, {
+                  key: 'again', label: t('changeMachine'),
+                  onClick: function () { setStep('pick'); setMachine(null); setListing(null); setError(null); setOpenTask(null) },
+                }),
+                React.createElement(ActionButton, { key: 'back', label: t('back'), primary: true, onClick: backToBrowse }),
+              ]
+            } else {
             // 第 2 步：看着**远程真实目录**点选项目文件夹
             var items = []
             items.push(React.createElement('div', {
@@ -1136,6 +1291,7 @@ window.__ModuleLoader__.load({
                 primary: true, disabled: busy || listing === null, onClick: openProject,
               }),
             ]
+            }
           } else {
             var pane = []
             var hintLine = function (text) {
@@ -1150,8 +1306,8 @@ window.__ModuleLoader__.load({
                 pane.push(hintLine(t('pickDistro')))
                 // ⚠️ **全列出来**（与 `wsl -l -q` 一致），系统发行版只**排最后**。
                 // 之前是直接隐藏 —— 那会让列表和 `wsl -l -q` 对不上，用户以为插件漏了；
-                // 而且「按名字硬编码地隐藏」换个工具就漏判（用户提醒）。
-                // 也**不加标注**：用户明确说过那行小字不要（留着可选项就够了）。
+                // 而且「按名字硬编码地隐藏」换个工具就漏判。
+                // 也**不加标注**：那行小字是多余的（列表本身就是答案）。
                 var systemSet = wslInfo !== null && Array.isArray(wslInfo.systemDistros) ? wslInfo.systemDistros : []
                 var distroEntries = distros.map(function (name) {
                   var isSystem = systemSet.indexOf(name) >= 0
@@ -1267,7 +1423,7 @@ window.__ModuleLoader__.load({
                     },
                   }, t('backToList')))
                 }
-                pane.push(React.createElement(Field, { key: 'host', label: t('fieldHost'), value: form.host, placeholder: '10.0.0.5', onChange: set('host') }))
+                pane.push(React.createElement(Field, { key: 'host', label: t('fieldHost'), value: form.host, placeholder: '192.0.2.10', onChange: set('host') }))
                 pane.push(React.createElement(Field, { key: 'port', label: t('fieldPort'), value: form.port, placeholder: '22', onChange: set('port') }))
                 pane.push(React.createElement(Field, { key: 'user', label: t('fieldUsername'), value: form.username, placeholder: 'you', onChange: set('username') }))
                 pane.push(React.createElement(Field, { key: 'key', label: t('fieldKeyPath'), value: form.privateKeyPath, placeholder: '~/.ssh/id_ed25519', onChange: set('privateKeyPath') }))
@@ -1583,58 +1739,60 @@ window.__ModuleLoader__.load({
           // **不在插件的生效作用域内**，注册静默失效。
           // 症状极具误导性：界面表现只是「还是官方行为」，没有任何报错，
           // 插槽的占用者查出来还是官方的 `mf`。**实测踩到，别再犯。**
-          var enabled = config === undefined || config === null || config.workspaceFlow !== false
-          report('workspace-flow', enabled, 'config=' + JSON.stringify(config === undefined ? null : config))
-          if (enabled) {
-            // 入口 ①：侧边栏的导航行。宿主负责画按钮、管选中态、渲染标签，
-            // 我们只交图标组件 —— 所以观感和官方那几项完全一致。
-            try {
-              slots.inject('sidebar.panellist', function () {
-                return slots.register({
-                  name: 'sidebar.panellist',
-                  id: PANEL_ID,
-                  order: 50,
-                  label: function () { return t('remoteConnect') },
-                }, RemotePanelIcon)
-              })
-              report('inject-panellist', true)
-              console.info('[dsh-multi-remote] 已注册侧边栏入口（sidebar.panellist，加法式）')
-            } catch (cause) {
-              report('inject-panellist', false, cause && cause.message ? cause.message : cause)
-              console.warn('[dsh-multi-remote] 注册侧边栏入口失败:', cause)
-            }
+          // 入口**无条件注册**。
+          //
+          // 我们**不自造「显示 / 隐藏入口」开关** —— 插件的开与关由 **DSH 自己管**：
+          // 在插件管理器里关掉它，loader 会写 `disabled: true`，整行直接不加载
+          // （实测：插件路由 404，而包仍然装着）。自造开关既**多余**（宿主做得更彻底，
+          // 连工具一起关），又**半残** —— 客户端半边跑在浏览器里，改了配置得刷新页面
+          // 才生效，用户会以为没生效。
+          report('inject-start', true, 'config=' + JSON.stringify(config === undefined ? null : config))
 
-            // 入口 ②：`main` 里那一格**触发器**。keyed 槽位 —— 用一个新 key 就是
-            // 多一格，谁也不影响谁。**必须和 ① 一起注册**：少了它，侧边栏那一行
-            // 点下去是一片空白（宿主靠同一个 id 配对）。
-            // 它自己不画界面 —— 只负责开弹窗，然后把主区域切回会话。
-            try {
-              slots.inject('main', function () {
-                return slots.register({ name: 'main', key: PANEL_ID }, RemoteTrigger)
-              })
-              report('inject-main-panel', true)
-              console.info('[dsh-multi-remote] 已注册面板触发器（main，key=%s）', PANEL_ID)
-            } catch (cause) {
-              report('inject-main-panel', false, cause && cause.message ? cause.message : cause)
-              console.warn('[dsh-multi-remote] 注册面板触发器失败:', cause)
-            }
+          // 入口 ①：侧边栏的导航行。宿主负责画按钮、管选中态、渲染标签，
+          // 我们只交图标组件 —— 所以观感和官方那几项完全一致。
+          try {
+            slots.inject('sidebar.panellist', function () {
+              return slots.register({
+                name: 'sidebar.panellist',
+                id: PANEL_ID,
+                order: 50,
+                label: function () { return t('remoteConnect') },
+              }, RemotePanelIcon)
+            })
+            report('inject-panellist', true)
+            console.info('[dsh-multi-remote] 已注册侧边栏入口（sidebar.panellist，加法式）')
+          } catch (cause) {
+            report('inject-panellist', false, cause && cause.message ? cause.message : cause)
+            console.warn('[dsh-multi-remote] 注册侧边栏入口失败:', cause)
+          }
 
-            // 入口 ③：**弹窗本体**，挂在 `shell.overlay`（全窗口浮层）上。
-            // 为什么不在主区域里画：那样弹窗会被关在中央区域里，盖不住侧边栏，
-            // 看起来就不像个弹窗。`shell.overlay` 是 root 作用域，盖住整个框架。
-            try {
-              slots.inject('shell.overlay', function () {
-                return slots.register({ name: 'shell.overlay', id: PANEL_ID + '-dialog', order: 50 }, RemoteDialog)
-              })
-              report('inject-overlay', true)
-              console.info('[dsh-multi-remote] 已注册弹窗宿主（shell.overlay）')
-            } catch (cause) {
-              report('inject-overlay', false, cause && cause.message ? cause.message : cause)
-              console.warn('[dsh-multi-remote] 注册弹窗宿主失败:', cause)
-            }
-          } else {
-            report('inject-panellist', true, 'skipped: workspaceFlow=false')
-            console.info('[dsh-multi-remote] workspaceFlow 已关闭 —— 不注册入口')
+          // 入口 ②：`main` 里那一格**触发器**。keyed 槽位 —— 用一个新 key 就是
+          // 多一格，谁也不影响谁。**必须和 ① 一起注册**：少了它，侧边栏那一行
+          // 点下去是一片空白（宿主靠同一个 id 配对）。
+          // 它自己不画界面 —— 只负责开弹窗，然后把主区域切回会话。
+          try {
+            slots.inject('main', function () {
+              return slots.register({ name: 'main', key: PANEL_ID }, RemoteTrigger)
+            })
+            report('inject-main-panel', true)
+            console.info('[dsh-multi-remote] 已注册面板触发器（main，key=%s）', PANEL_ID)
+          } catch (cause) {
+            report('inject-main-panel', false, cause && cause.message ? cause.message : cause)
+            console.warn('[dsh-multi-remote] 注册面板触发器失败:', cause)
+          }
+
+          // 入口 ③：**弹窗本体**，挂在 `shell.overlay`（全窗口浮层）上。
+          // 为什么不在主区域里画：那样弹窗会被关在中央区域里，盖不住侧边栏，
+          // 看起来就不像个弹窗。`shell.overlay` 是 root 作用域，盖住整个框架。
+          try {
+            slots.inject('shell.overlay', function () {
+              return slots.register({ name: 'shell.overlay', id: PANEL_ID + '-dialog', order: 50 }, RemoteDialog)
+            })
+            report('inject-overlay', true)
+            console.info('[dsh-multi-remote] 已注册弹窗宿主（shell.overlay）')
+          } catch (cause) {
+            report('inject-overlay', false, cause && cause.message ? cause.message : cause)
+            console.warn('[dsh-multi-remote] 注册弹窗宿主失败:', cause)
           }
         } else {
           report('slots-missing', false, 'ctx.slots 不可用')

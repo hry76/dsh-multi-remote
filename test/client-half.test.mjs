@@ -73,6 +73,9 @@ function loadClient(options = {}) {
       }
       return undefined
     },
+    useRef(initial) {
+      return { current: initial }
+    },
   }
 
   const requireFn = (name) => {
@@ -190,20 +193,23 @@ test('客户端：apply **同步**注册侧边栏入口 + 面板（两半必须�
   assert.equal(typeof overlay.component, 'function', '要给出弹窗组件')
 })
 
-test('客户端：workspaceFlow=false 时**完全不注册**入口', () => {
-  const { exports, ctx, registered } = loadClient()
-  exports.apply(ctx, { workspaceFlow: false })
-
-  for (const name of ['sidebar.panellist', 'main', 'shell.overlay']) {
-    assert.equal(
-      registered.filter((entry) => entry.name === name).length,
-      0,
-      `关掉之后不许注册 ${name}`,
-    )
+test('客户端：入口**无条件注册** —— 插件的开关由 DSH 自己管', () => {
+  // 曾经有个 `workspaceFlow` 开关能「只关界面入口、保留工具」。已删：
+  // ① 多余 —— 宿主插件管理器关掉它时连工具一起关，做得更彻底；
+  // ② 半残 —— 客户端半边在浏览器里，改了配置要刷新页面才生效。
+  // 现在无论 config 传什么（包括 undefined / 空对象 / 无关字段），入口都要注册。
+  for (const config of [undefined, {}, { someOtherKey: false }]) {
+    const { exports, ctx, registered } = loadClient()
+    exports.apply(ctx, config)
+    for (const name of ['sidebar.panellist', 'main', 'shell.overlay']) {
+      assert.equal(
+        registered.filter((entry) => entry.name === name).length,
+        1,
+        `config=${JSON.stringify(config)} 时也必须注册 ${name}`,
+      )
+    }
   }
-  // 设置页仍然要在（关的只是入口）
-  assert.equal(registered.filter((entry) => entry.name === 'settings.section').length, 1)
-  // 负对照：忽略开关 → 用户关不掉，只能卸载整个插件
+  // 负对照：把注册包回 `if (config.xxx)` → 上面三组里至少一组变红
 })
 
 test('客户端：绝不注册 `+` 按钮的目录流程（会让官方插件激活失败）', () => {

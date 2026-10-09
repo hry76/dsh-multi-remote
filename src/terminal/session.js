@@ -573,6 +573,8 @@ export class TerminalSessionBase {
 
     this.activeSend = operation
     operation.start()
+    // 这里吞掉 rejection 只是**防止未处理拒绝**：错误本身在返回的
+    // `operation.done` 上，调用方 await 它就能拿到（见本函数的返回值）
     operation.done.catch(() => {}).finally(() => {
       if (this.activeSend === operation) this.activeSend = undefined
     })

@@ -149,12 +149,13 @@ export class Mirror {
   /**
    * 建立 / 刷新镜像基线。
    *
-   * @param {{ signal?: AbortSignal, force?: boolean }} [options]
+   * @param {{ signal?: AbortSignal, force?: boolean,
+   *           onProgress?: (p: { phase: 'walk'|'fetch', visited?: number, done?: number, total?: number }) => void }} [options]
    *   `force` 为真时无条件整棵重建（手动刷新用）。
    * @returns {Promise<object>} 结果报告 —— **不抛异常**，失败在 `errors` 里
    */
   async init(options = {}) {
-    const { signal, force = false } = options
+    const { signal, force = false, onProgress } = options
     const report = {
       anchorPath: this.anchorPath,
       remoteRoot: this.remoteRoot,
@@ -195,6 +196,7 @@ export class Mirror {
         ignore: this.ignore,
         bounds: this.bounds,
         signal,
+        onProgress,
         // 重建时不用旧指纹（文件已经清掉了，指纹无意义）
         manifest: report.rebuilt ? {} : (previous?.manifest ?? {}),
       })
@@ -224,6 +226,9 @@ export class Mirror {
       })
       await this.state.write(this.resolvedAnchor)
     } catch (error) {
+      // abort 是**终态**：用户点了取消，不能像「单个文件失败」那样吞进 errors ——
+      // 必须抛出去让连接层 catch 到，进而 disconnect + 删掉半截锚点。
+      if (signal?.aborted === true) throw error
       report.errors = [
         ...report.errors,
         { path: this.remoteRoot, code: error?.code ?? 'MIRROR_INIT_FAILED', message: String(error?.message ?? error) },

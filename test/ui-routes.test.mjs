@@ -253,9 +253,11 @@ test('normalizeClientReport：能收多少收多少，绝不抛错', () => {
 
 // ── 自动生成连接 id（界面不要求用户起名）────────────────────────────────────
 
-test('deriveConnectId：后端 + 远程根 → 合法 id', () => {
-  assert.equal(deriveConnectId('wsl', '/home/user/proj'), 'wsl-home-user-proj')
-  assert.equal(deriveConnectId('ssh', '/srv/app'), 'ssh-srv-app')
+test('deriveConnectId：后端 + 远程根 → 合法 id（可读前缀 + 12 位哈希）', () => {
+  const wsl = deriveConnectId('wsl', '/home/user/proj')
+  assert.match(wsl, /^wsl-home-user-proj-[0-9a-f]{12}$/)
+  assert.equal(deriveConnectId('ssh', '/srv/app'), deriveConnectId('ssh', '/srv/app'), '同一输入必须稳定')
+  assert.match(deriveConnectId('ssh', '/srv/app'), /^ssh-srv-app-[0-9a-f]{12}$/)
   // 大写、点号、下划线、中文都要被清理 —— **id 绝不能含点号**（会进预设 id，实测炸过插件树）
   const messy = deriveConnectId('wsl', '/home/user/My.Project_2026')
   assert.ok(!messy.includes('.'), `不该含点号：${messy}`)
@@ -264,11 +266,21 @@ test('deriveConnectId：后端 + 远程根 → 合法 id', () => {
   // 负对照：直接拿远程根当 id → 大写/点号进预设 id → 插件树加载失败
 })
 
+test('deriveConnectId：长公共前缀的两个不同项目**必须**得到不同 id', () => {
+  // 2026-10-13 实测事故：只用路径派生（截断到 60）时，长公共前缀的两个项目
+  // 会撞同一个 id → 第二个项目 connect 抛「档案 X 已经连接」→「连第二个不能用」。
+  const a = deriveConnectId('ssh', `/home/jk/ofwb/${'x'.repeat(60)}/main`)
+  const b = deriveConnectId('ssh', `/home/jk/ofwb/${'x'.repeat(60)}/main/of`)
+  assert.notEqual(a, b, '截断后也必须能区分')
+  assert.ok(a.length <= 60 && b.length <= 60, '长度仍受 60 限制')
+  // 负对照：没有哈希后缀 → 前缀相同时必撞（上面两个截断后一模一样）
+})
+
 test('deriveConnectId：退化场景不产生空串或怪名字', () => {
-  assert.equal(deriveConnectId('wsl', '/'), 'wsl')
-  assert.equal(deriveConnectId('wsl', ''), 'wsl')
-  assert.equal(deriveConnectId('docker', '///'), 'docker')
-  // 超长截断后仍不以 - 结尾
+  assert.match(deriveConnectId('wsl', '/'), /^wsl-[0-9a-f]{12}$/)
+  assert.match(deriveConnectId('wsl', ''), /^wsl-[0-9a-f]{12}$/)
+  assert.match(deriveConnectId('docker', '///'), /^docker-[0-9a-f]{12}$/)
+  // 超长截断后仍不以 - 结尾，且总长受控
   const long = deriveConnectId('ssh', '/' + 'a'.repeat(200))
   assert.ok(long.length <= 60 && !long.endsWith('-'))
 })

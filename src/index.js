@@ -226,6 +226,16 @@ export function apply(ctx, config = {}) {
     agentPresets: ctx.agentPresets,
     log: (...args) => log?.info?.(...args),  })
 
+  // 方案 A 迁移清理：清掉宿主进程里**上一次运行遗留**的「每项目一个预设」。
+  // 那些预设是常驻的（只在插件卸载时注销），不清的话模式选择器里会残留 N 个
+  // 「远程模式 · <项目名>」—— 用户实测撞见过（2026-10-13）。
+  // 注意：这是**只删我们自己的旧格式**（`multi-remote-` 开头且 ≠ `multi-remote`），
+  // 宿主的官方预设与其它插件的一概不碰。
+  // 失败不阻断启动：清理不了也只是列表里多几条，连接与照旧能用。
+  void presetRegistry.purgeLegacyPresets().catch((error) => {
+    log?.warn?.('[dsh-multi-remote] 清理历史遗留预设失败（不影响本次运行）：%s', error?.message ?? error)
+  })
+
   // 会话绑定钩子：抓住「刚创建、第一轮还没开始」的窗口
   ctx.effect(() => binder.install(ctx), `${name}: 会话绑定钩子`)
 
@@ -830,9 +840,33 @@ export function apply(ctx, config = {}) {
 
       // 复用机器的档案（含凭据）＋ 选中的目录；**连接档案 id 按目录重新推导**
       // —— 否则同一台机器上的第二个项目会撞 id（`档案 X 已经连接`）。
+      //
+      // ⚠️ **旧档案 id 兼容**（2026-10-13）：`deriveConnectId` 从「纯路径截断」
+      // 改成了「可读前缀 + 哈希后缀」（修长公共前缀撞 id）。老档案存的是旧格式 id，
+      // 直接推会得到一个新 id → 同一个项目被当成新档案（重新拉镜像、列表里出现两条）。
+      // 所以先按 remoteRoot 反查已存档案：命中就复用它的 id，没命中才用新格式。
+      let connectId = deriveConnectId(machine.kind, remoteRoot)
+      if (typeof profileStoreDir === 'string') {
+        try {
+          const saved = await listProfiles(profileStoreDir)
+          const same = saved.find((entry) =>
+            entry.machine !== true
+            && entry.kind === machine.kind
+            && entry.remoteRoot === remoteRoot
+            && entry.anchorParent === (typeof body.anchorParent === 'string' && body.anchorParent !== '' ? body.anchorParent : defaultAnchorParent()))
+          if (same !== undefined && same.id !== connectId) {
+            connectId = same.id
+            audit.record('connect-id-legacy-reuse', { profileId: same.id, remoteRoot })
+          }
+        } catch (error) {
+          // 反查失败不影响本次连接（只是拿不到旧 id，按新 id 走）
+          log?.warn?.('[dsh-multi-remote] 旧档案 id 反查失败：%s', error?.message ?? error)
+        }
+      }
+
       const input = {
         ...machine.profile,
-        id: deriveConnectId(machine.kind, remoteRoot),
+        id: connectId,
         remoteRoot,
         anchorParent: typeof body.anchorParent === 'string' && body.anchorParent !== '' ? body.anchorParent : defaultAnchorParent(),
       }

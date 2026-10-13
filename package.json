@@ -1,6 +1,6 @@
 {
   "name": "@jk-uzi/dsh-multi-remote",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH 插件：SSH / WSL / Docker 三合一远程开发——agent 的文件读写、命令执行、搜索与终端全部落在目标环境，大脑留在本地",
   "type": "module",
   "main": "src/index.js",

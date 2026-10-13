@@ -19,6 +19,7 @@
  * 凭据例外：`password` / `privateKey` / `passphrase` 属于「敏感字段」，
  * 允许传（SSH 场景绕不开），但**任何响应里都不回显**，也不写进审计。
  */
+import { createHash } from 'node:crypto'
 
 /** 界面读「有哪些可选项」的路由。 */
 export const ROUTE_UI_OPTIONS = '/multi-remote/connect-options'
@@ -235,14 +236,22 @@ const REQUIRED_BY_KIND = {
  * （2026-10-07 实测：界面没发 id，宿主报「id 必填」，连接被拒。）
  *
  * 规则：小写、只留 `[a-z0-9-]`（**绝不能含点号** —— id 会进预设 id，
- * 含点号会让插件树加载失败，实测踩过）、截断到 60 字符。
+ * 含点号会让插件树加载失败，实测踩过）、可读前缀 + **12 位哈希后缀**。
+ *
+ * ⚠️ **为什么必须有哈希后缀**（2026-10-13 实测事故）：
+ * 只用路径派生时，长路径会被截断到固定长度 —— 两个**不同**的项目
+ * （同一台机器上共享很长公共前缀的两个目录）会得到**同一个 id**。
+ * 后果是第二个项目 `connections.connect()` 直接抛「档案 X 已经连接」，
+ * 用户看到「连第二个不能用」，且完全没有线索（措辞像重复连接，不像撞 id）。
+ * 哈希把撞 id 概率降到可忽略，同时保留可读前缀便于人工排查。
  *
  * @param {string} kind
  * @param {string} remoteRoot
  * @returns {string}
  */
 export function deriveConnectId(kind, remoteRoot) {
-  const slug = String(remoteRoot ?? '')
+  const root = String(remoteRoot ?? '').trim()
+  const slug = root
     .toLowerCase()
     .split('/')
     .filter((part) => part !== '')
@@ -251,7 +260,10 @@ export function deriveConnectId(kind, remoteRoot) {
     .replace(/-+/g, '-')
     .replace(/^-+|-+$/g, '')
   const base = slug === '' ? String(kind ?? 'remote') : `${kind}-${slug}`
-  return base.slice(0, 60).replace(/-+$/g, '')
+  // 可读前缀最多 40 字符，剩下的预算留给哈希 —— 总长仍受 60 限制
+  const prefix = base.slice(0, 40).replace(/-+$/g, '')
+  const digest = createHash('sha256').update(`${kind}\0${root}`, 'utf8').digest('hex').slice(0, 12)
+  return `${prefix}-${digest}`
 }
 
 /**

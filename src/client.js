@@ -401,6 +401,13 @@ window.__ModuleLoader__.load({
           label2: 'var(--dsw-alias-label-secondary, #9a9ba1)',
           brand: 'var(--dsw-alias-brand-primary, #4b7bf5)',
           error: 'var(--dsw-alias-state-error-primary, #e5544b)',
+          // 主按钮：**背景与文字必须成对取 token**，绝不硬编码 `#fff`。
+          // 2026-10-13 实测事故：写死白字配 `brand-primary`，在浅色品牌主题下
+          // brand 变成浅色 → 白字白底，「连接」按钮整个看不见（用户报「按钮上的字不显示了」）。
+          // 这对 token 由主题保证对比度，换任何主题都成立。
+          btnPrimaryFill: 'var(--dsw-alias-button-primary-fill, #4b7bf5)',
+          btnPrimaryText: 'var(--dsw-alias-label-primary-foreground, #ffffff)',
+          switchThumb: 'var(--dsw-alias-switch-thumb, #ffffff)',
         }
 
         // ── 设置页小节 ────────────────────────────────────────────────────
@@ -602,8 +609,8 @@ window.__ModuleLoader__.load({
               borderRadius: '8px',
               fontFamily: 'inherit',
               border: '1px solid ' + (primary ? 'transparent' : T.border1),
-              background: primary ? T.brand : T.bgLayer1,
-              color: primary ? '#fff' : T.label1,
+              background: primary ? T.btnPrimaryFill : T.bgLayer1,
+              color: primary ? T.btnPrimaryText : T.label1,
               cursor: disabled ? 'default' : 'pointer',
               opacity: disabled ? 0.55 : 1,
               fontSize: '13px',
@@ -632,8 +639,8 @@ window.__ModuleLoader__.load({
               cursor: disabled ? 'default' : 'pointer',
               opacity: disabled ? 0.55 : 1,
               border: '1px solid ' + (primary ? 'transparent' : T.border1),
-              background: primary ? T.brand : 'transparent',
-              color: primary ? '#fff' : T.label1,
+              background: primary ? T.btnPrimaryFill : 'transparent',
+              color: primary ? T.btnPrimaryText : T.label1,
             },
           }, props.label)
         }
@@ -703,7 +710,7 @@ window.__ModuleLoader__.load({
               style: {
                 position: 'absolute', top: '2px', left: on ? '18px' : '2px',
                 width: '14px', height: '14px', borderRadius: '50%',
-                background: '#fff',
+                background: T.switchThumb,
               },
             })),
           )
@@ -907,18 +914,22 @@ window.__ModuleLoader__.load({
             return emptyText
           }
 
-          /** 把一条用过的连接填进表单 —— 凭据（密码）永远要现给。 */
+          /**
+           * 把一条用过的连接填进表单 —— 凭据（密码）永远要现给。
+           *
+           * ⚠️ **必须先整张重置再填**（2026-10-13 实测事故）：以前是「在旧值上合并」，
+           * 于是连过 A 再点 B 时，A 留下的字段（私钥路径尤其明显）会残留下来，
+           * 用户看到「第二个连接带着第一个的连接信息」，且发出去的请求就是错的。
+           * 重置保证表单**只有**这一条档案的字段，没有上一个的残余。
+           */
           function useProfile(entry) {
-            setForm(function (previous) {
-              var next = {}
-              for (var k in previous) if (Object.prototype.hasOwnProperty.call(previous, k)) next[k] = previous[k]
-              next.host = entry.host === undefined || entry.host === null ? '' : String(entry.host)
-              next.port = entry.port === undefined || entry.port === null ? '' : String(entry.port)
-              next.username = entry.username === undefined || entry.username === null ? '' : String(entry.username)
-              next.privateKeyPath = entry.privateKeyPath === undefined || entry.privateKeyPath === null ? '' : String(entry.privateKeyPath)
+            setForm({
+              host: entry.host === undefined || entry.host === null ? '' : String(entry.host),
+              port: entry.port === undefined || entry.port === null ? '' : String(entry.port),
+              username: entry.username === undefined || entry.username === null ? '' : String(entry.username),
+              privateKeyPath: entry.privateKeyPath === undefined || entry.privateKeyPath === null ? '' : String(entry.privateKeyPath),
               // 档案里**没有凭据**（宿主刻意不回显），密码要重新输
-              next.password = ''
-              return next
+              password: '',
             })
             setSshEditing(true)
           }

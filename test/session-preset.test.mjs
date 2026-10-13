@@ -38,6 +38,7 @@ function fakeAgentPresets(options = {}) {
     /** 测试可以指定某个 id 激活失败。 */
     brokenIds: new Set(options.brokenIds ?? []),
     registerCalls: [],
+    unregisterCalls: [],
     async register(definition) {
       this.registerCalls.push(definition.id)
       if (definitions.has(definition.id)) throw new Error(`Duplicate agent preset: ${definition.id}`)
@@ -48,6 +49,12 @@ function fakeAgentPresets(options = {}) {
         disposed = true
         definitions.delete(definition.id)
       }
+    },
+    /** 宿主侧反注册（`purgeLegacyPresets` 清理上次进程遗留预设时走这条）。 */
+    async unregister(id) {
+      this.unregisterCalls.push(id)
+      if (!definitions.has(id)) throw new Error(`Unknown agent preset: ${id}`)
+      definitions.delete(id)
     },
     async compositionInventory() {
       return [...definitions.keys()].map((id) => ({
@@ -408,4 +415,48 @@ test('PresetRegistry.unregisterAll：一次清干净，失败也继续', async (
   assert.equal(summary.failed, 0)
   assert.deepEqual(registry.registeredIds, [])
   // 负对照：用串行 await 且不 catch，第一个失败会让后面的预设留在注册表里
+})
+
+// ── 方案 A 迁移：清掉上次进程遗留的「每项目一个预设」─────────────────────────
+
+test('purgeLegacyPresets：只清 multi-remote- 系的旧预设，单一远程模式与其它插件不碰', async () => {
+  const agentPresets = fakeAgentPresets()
+  const registry = new PresetRegistry({ agentPresets })
+
+  // 新预设：本次注册
+  await registry.register(buildPresetDefinition())
+
+  // 遗留预设：模拟**上次进程**注册的（本实例没有 disposer，只能走宿主接口）
+  await agentPresets.register({ id: 'multi-remote-ssh-home-jk-a-aaaaaaaaaaaa', name: '远程模式 · a', plugins: [] })
+  await agentPresets.register({ id: 'multi-remote-ssh-home-jk-b-bbbbbbbbbbbb', name: '远程模式 · b', plugins: [] })
+  // 别人的预设：绝不碰
+  await agentPresets.register({ id: 'someone-elses-plugin', name: '别家的', plugins: [] })
+
+  const outcome = await registry.purgeLegacyPresets()
+
+  assert.deepEqual(outcome.removed.sort(), [
+    'multi-remote-ssh-home-jk-a-aaaaaaaaaaaa',
+    'multi-remote-ssh-home-jk-b-bbbbbbbbbbbb',
+  ])
+  assert.equal(outcome.failed, 0)
+
+  const inventory = await agentPresets.compositionInventory()
+  assert.deepEqual(inventory.map((row) => row.id).sort(), ['multi-remote', 'someone-elses-plugin'])
+  // 负对照：不清理 → 模式选择器里残留 N 个「远程模式 · <项目名>」（用户实测撞见过）
+})
+
+test('purgeLegacyPresets：宿主没有 unregister 接口时如实报失败，不假装清掉了', async () => {
+  const agentPresets = fakeAgentPresets()
+  delete agentPresets.unregister
+  const registry = new PresetRegistry({ agentPresets })
+  await registry.register(buildPresetDefinition())
+  await agentPresets.register({ id: 'multi-remote-legacy-cccccccccccc', name: '遗留', plugins: [] })
+
+  const outcome = await registry.purgeLegacyPresets()
+
+  assert.deepEqual(outcome.removed, [])
+  assert.equal(outcome.failed, 1, '清不掉要算失败，绝不谎报成功')
+  const inventory = await agentPresets.compositionInventory()
+  assert.ok(inventory.some((row) => row.id === 'multi-remote-legacy-cccccccccccc'), '没清掉就还在')
+  // 负对照：返回 removed:[id] 假装成功 → 列表里明明还有，却告诉上层清完了
 })

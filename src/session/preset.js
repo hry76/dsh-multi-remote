@@ -405,11 +405,75 @@ export class PresetRegistry {
     return true
   }
 
+  /**
+   * 从宿主注册表里**反注册**一个预设（不依赖本实例是否持有 disposer）。
+   *
+   * 用于清理**上一次进程**注册的遗留预设 —— 那些 disposer 早随进程消失了，
+   * 走宿主的 `unregister(id)` 接口才是唯一能它们清掉的路径。
+   * 宿主没有这个方法时就放弃清理（返回 false），**不假装成功**。
+   *
+   * @param {string} id
+   * @returns {Promise<boolean>} 是否真的清掉了
+   */
+  async unregisterFromHost(id) {
+    const key = String(id ?? '').trim()
+    if (key === '') throw new Error('unregisterFromHost 需要非空的 id')
+    const unregister = this.agentPresets?.unregister
+    if (typeof unregister !== 'function') return false
+    try {
+      await unregister.call(this.agentPresets, key)
+      this.disposers.delete(key)
+      this.diagnostics.delete(key)
+      return true
+    } catch (error) {
+      // 宿主反注册失败（例如 id 已被别人清掉）→ 如实报失败，由调用方决定
+      this.log?.('[preset] 宿主反注册 %s 失败：%s', key, error?.message ?? error)
+      return false
+    }
+  }
+
   /** 注销全部（插件卸载时调用）。 */
   async unregisterAll() {
     const ids = [...this.disposers.keys()]
     const results = await Promise.allSettled(ids.map((id) => this.unregister(id)))
     return { removed: ids.length, failed: results.filter((result) => result.status === 'rejected').length }
+  }
+
+  /**
+   * **清掉历史遗留的「每项目一个预设」**（方案 A 迁移清理，只跑一次）。
+   *
+   * 背景：方案 A 之前，每打开一个远程项目就注册一个
+   * `multi-remote-<档案>-<哈希>` 预设。这些预设是**常驻**的（只在插件卸载时
+   * 才注销），于是升级后在宿主进程里残留下来 —— 模式选择器里出现 N 个
+   * 「远程模式 · <项目名>」，用户实测撞见过（2026-10-13）。
+   *
+   * 判定规则（刻意保守，只删**确定是我们自己生成的旧格式**）：
+   *   - id 以 `multi-remote-` 开头（带连字符 → 旧的派生格式）
+   *   - 且 id ≠ `multi-remote`（现在的单一预设）
+   * 其它插件的预设、宿主的官方预设一律不碰。
+   *
+   * @returns {Promise<{ removed: string[], failed: number }>}
+   */
+  async purgeLegacyPresets() {
+    const inventory = await this.agentPresets.compositionInventory().catch(() => [])
+    const legacy = (Array.isArray(inventory) ? inventory : [])
+      .map((row) => row?.id)
+      .filter((id) => typeof id === 'string' && id.startsWith(`${PRESET_ID}-`) && id !== PRESET_ID)
+
+    const removed = []
+    let failed = 0
+    for (const id of legacy) {
+      // 自己注册过的走 disposer（干净）；上次进程遗留的走宿主接口
+      const ok = this.disposers.has(id)
+        ? await this.unregister(id)
+        : await this.unregisterFromHost(id)
+      if (ok) removed.push(id)
+      else failed += 1
+    }
+    if (removed.length > 0) {
+      this.log?.('[preset] 清理了 %d 个历史遗留的每项目预设：%s', removed.length, removed.join(', '))
+    }
+    return { removed, failed }
   }
 
   /** 当前已注册的预设 id。 */
